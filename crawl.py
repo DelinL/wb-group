@@ -11,15 +11,19 @@
     python crawl.py --set-cookie 'SUB=xxx; SUBP=yyy'   # 首次设置 cookie（手动）
     python crawl.py --probe-boundary                    # 盲测所有群最早边界
     python crawl.py --probe-boundary --gid 4761715839862414  # 只测指定群
-    python crawl.py --renew-cookie                     # 打开浏览器扫码续期 cookie
+    python crawl.py --renew-cookie                     # 打开本机 Chrome 扫码续期 cookie
+    python crawl.py --renew-cookie --no-chrome         # 强制用 Playwright 自带 Chromium 扫码
+    python crawl.py --renew-cookie --chrome-path /path/to/chrome  # 指定 Chrome 路径
     python crawl.py --check-playwright                 # 检查 Playwright 环境就绪
     python crawl.py --stats                            # 打印数据库统计
     python crawl.py --search 关键词                    # 全文搜索消息
 
 扫码登录流程（--renew-cookie）：
-    程序用 Playwright 打开微博扫码页，把二维码截图保存到本地文件并尝试用
-    系统默认程序打开图片。你在控制台看到「请扫码」提示后，用微博 APP 扫码，
-    程序检测到登录成功后会把 cookie 写入数据库。
+    程序优先调用本机已安装的 Chrome（Google Chrome）打开微博扫码页；若本机
+    没有 Chrome 则回退到 Playwright 自带的 Chromium。二维码截图保存到本地文件
+    并尝试用系统默认程序打开图片。你在控制台看到「请扫码」提示后，用微博 APP
+    扫码，程序检测到登录成功后会把 cookie 写入数据库。
+    也可用 --no-chrome 强制走自带 Chromium，或 --chrome-path 指定 Chrome 路径。
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ import time
 import argparse
 import logging
 import platform
+import shutil
 import subprocess
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -75,30 +80,118 @@ def _open_image_cross_platform(path: str):
         pass
 
 
-def _check_playwright(log: logging.Logger) -> bool:
-    """检查 Playwright + Chromium 环境是否就绪。打印诊断信息，返回是否通过。"""
-    ok = True
+def _find_chrome_executable() -> str | None:
+    """跨平台探测本机已安装的 Google Chrome 可执行文件路径。
 
+    返回首个存在的路径；找不到返回 None（不影响回退到 Playwright 自带 Chromium）。
+    """
+    candidates: list[str] = []
+    if sys.platform == "darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ]
+    elif sys.platform.startswith("win"):
+        candidates = [
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+    else:
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/opt/google/chrome/chrome",
+            "/snap/bin/chromium",
+        ]
+    # PATH 兜底
+    which = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+    if which:
+        candidates.append(which)
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _launch_browser(pw, *, headless: bool, chrome_path: str, no_chrome: bool, log: logging.Logger):
+    """启动浏览器用于扫码续期，优先调用本机 Chrome。
+
+    优先级：
+      1. ``--chrome-path`` 显式指定的本机 Chrome 可执行文件
+      2. 本机已安装的 Chrome（Playwright ``channel="chrome"``）
+      3. Playwright 自带 Chromium（``--no-chrome`` 或前两者均不可用时回退）
+
+    Returns:
+        playwright 的 Browser 实例
+    """
+    launch_args = ["--disable-blink-features=AutomationControlled"]
+    if headless:
+        launch_args += ["--no-sandbox", "--disable-setuid-sandbox"]
+
+    # 1) 显式路径
+    if chrome_path:
+        chrome_path = os.path.expanduser(chrome_path)
+        if not os.path.isfile(chrome_path):
+            log.warning("指定的 --chrome-path 不存在: %s，回退其它方式", chrome_path)
+        else:
+            log.info("使用本机 Chrome（--chrome-path）: %s", chrome_path)
+            return pw.chromium.launch(executable_path=chrome_path, headless=headless, args=launch_args)
+
+    # 2) 本机已安装 Chrome
+    if not no_chrome:
+        try:
+            log.info("尝试调用本机已安装的 Chrome（channel=chrome）...")
+            return pw.chromium.launch(channel="chrome", headless=headless, args=launch_args)
+        except Exception as e:
+            log.warning("未找到本机 Chrome（%s），回退 Playwright 自带 Chromium", str(e).split("\n")[0])
+
+    # 3) 自带 Chromium
+    log.info("使用 Playwright 自带 Chromium")
+    return pw.chromium.launch(headless=headless, args=launch_args)
+
+
+def _check_playwright(log: logging.Logger) -> bool:
+    """检查 Playwright 环境是否就绪（浏览器能启动即可）。
+
+    优先检测本机已安装的 Chrome，其次回退到 Playwright 自带 Chromium。
+    打印诊断信息，返回是否通过。
+    """
     # 第一层：Python 包
     try:
         from playwright.sync_api import sync_playwright  # noqa: F811
         log.info("✅ playwright Python 包可导入")
     except ImportError:
         log.error("❌ playwright Python 包未安装（当前解释器: %s）", sys.executable)
-        log.error("   → uv add playwright && uv run playwright install chromium")
+        log.error("   → uv add playwright && uv run playwright install")
         return False
 
-    # 第二层：浏览器能启动
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
-            browser.close()
-        log.info("✅ Chromium 启动正常")
-    except Exception as e:
-        log.error("❌ Chromium 启动失败: %s", str(e).split("\n")[0])
-        ok = False
+    chrome_path = _find_chrome_executable()
+    if chrome_path:
+        log.info("✅ 检测到本机 Chrome: %s", chrome_path)
 
-    return ok
+    # 第二层：浏览器能启动（本机 Chrome 优先，Chromium 兜底）
+    with sync_playwright() as pw:
+        try:
+            if chrome_path:
+                b = pw.chromium.launch(executable_path=chrome_path, headless=True, args=["--no-sandbox"])
+            else:
+                b = pw.chromium.launch(channel="chrome", headless=True, args=["--no-sandbox"])
+            b.close()
+            log.info("✅ 本机 Chrome 启动正常")
+            return True
+        except Exception as e:
+            log.info("本机 Chrome 不可用（%s），尝试自带 Chromium", str(e).split("\n")[0])
+
+        try:
+            b = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+            b.close()
+            log.info("✅ Playwright 自带 Chromium 启动正常")
+            return True
+        except Exception as e:
+            log.error("❌ Chromium 启动失败: %s", str(e).split("\n")[0])
+            log.error("   → uv run playwright install chromium")
+            return False
 
 
 def _is_logged_in(page) -> bool:
@@ -116,12 +209,17 @@ def _is_logged_in(page) -> bool:
     return "#/chat" in href
 
 
-def _renew_cookie(db_path: str, log: logging.Logger, headless: bool):
+def _renew_cookie(db_path: str, log: logging.Logger, headless: bool, chrome_path: str = "", no_chrome: bool = False):
     """用 Playwright 打开 api.weibo.com/chat → 截图二维码 → 等你扫码 → 存 cookie
+
+    浏览器默认优先调用本机已安装的 Chrome（更顺手、可复用你 Chrome 里的登录态），
+    找不到时回退到 Playwright 自带 Chromium。
 
     Args:
         headless: True=无头模式（截图保存文件，靠文件查看二维码）；
                   False=有头模式（直接弹出浏览器窗口扫码，体验更直观）。
+        chrome_path: 显式指定本机 Chrome 可执行文件路径（为空则自动探测）。
+        no_chrome: True 时强制使用 Playwright 自带 Chromium，不调用本机 Chrome。
     """
     if not _check_playwright(log):
         log.error("请先解决以上问题后重试: uv run python crawl.py --renew-cookie")
@@ -130,12 +228,7 @@ def _renew_cookie(db_path: str, log: logging.Logger, headless: bool):
     from playwright.sync_api import sync_playwright  # noqa: F811
 
     with sync_playwright() as pw:
-        # Windows / macOS 上推荐有头模式，扫码更方便；Linux 无桌面用无头 + 截图
-        launch_args = ["--disable-blink-features=AutomationControlled"]
-        if headless:
-            launch_args.append("--no-sandbox")
-            launch_args.append("--disable-setuid-sandbox")
-        browser = pw.chromium.launch(headless=headless, args=launch_args)
+        browser = _launch_browser(pw, headless=headless, chrome_path=chrome_path, no_chrome=no_chrome, log=log)
         try:
             ctx = browser.new_context(
                 user_agent=(
@@ -374,6 +467,10 @@ def main():
                         help="检查 Playwright + Chromium 环境是否就绪（部署前验证）")
     parser.add_argument("--headless", action="store_true",
                         help="--renew-cookie 时使用无头模式（仅截图，不弹窗；默认有头弹窗）")
+    parser.add_argument("--chrome-path", default="",
+                        help="--renew-cookie 时指定本机 Chrome 可执行文件路径（默认自动探测）")
+    parser.add_argument("--no-chrome", action="store_true",
+                        help="--renew-cookie 时强制使用 Playwright 自带 Chromium（不调用本机 Chrome）")
     parser.add_argument("--verbose", action="store_true", help="详细日志")
     parser.add_argument("--probe-boundary", action="store_true",
                         help="盲测群聊最早可爬取边界（入群时间）")
@@ -430,7 +527,8 @@ def main():
 
     # --renew-cookie: 打开浏览器扫码续期
     if args.renew_cookie:
-        _renew_cookie(db_path, log, headless=args.headless)
+        _renew_cookie(db_path, log, headless=args.headless,
+                      chrome_path=args.chrome_path, no_chrome=args.no_chrome)
         return
 
     # --check-playwright: 验证 Playwright + Chromium 环境
