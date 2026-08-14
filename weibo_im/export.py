@@ -227,3 +227,181 @@ def list_members(db_path: str, gid: int) -> list[dict]:
             log.info("  sender_id=%-12d 发言=%-5d 最近=%s  %s",
                      m["sender_id"], m["msg_count"], last, m["sender_name"] or "(未知)")
     return members
+
+
+# ── 每日群聊日报导出 ───────────────────────────────────────
+
+
+def _resolve_target_sender_id(
+    gid: int,
+    sender_name: str | None,
+    sender_id: int | None,
+) -> int | None:
+    """解析目标成员的 sender_id（用于 is_target 标记）。
+
+    - sender_id 已提供 → 直接返回。
+    - 仅 sender_name → 查该群内该昵称最近一条发言的 sender_id（取最新值，避免改名漂移）。
+    - 都未提供 → 返回 None（is_target 全为 0，仅导出当日群聊上下文）。
+    """
+    if sender_id:
+        return int(sender_id)
+    if not sender_name:
+        return None
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT sender_id FROM messages "
+        "WHERE gid=? AND sender_name=? AND msg_type IN (100, 321) "
+        "ORDER BY created_at DESC LIMIT 1",
+        (gid, sender_name),
+    ).fetchone()
+    return int(row["sender_id"]) if row else None
+
+
+def _parse_date_to_day_range(date_str: str) -> tuple[int, int]:
+    """将日期字符串解析为 CST 当日 [start_ms, end_ms) 毫秒区间。
+
+    支持 "YYYY-MM-DD" 和 "YYYY/MM/DD" 两种格式。返回 (当日零点ms, 次日零点ms)。
+    """
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            dt = datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+        start_dt = dt.replace(tzinfo=CST)
+        start_ms = int(start_dt.timestamp() * 1000)
+        end_ms = start_ms + 86400000
+        return start_ms, end_ms
+    raise ValueError(
+        f"无法解析日期: {date_str}（支持格式 YYYY-MM-DD 或 YYYY/MM/DD）"
+    )
+
+
+def get_daily_context_messages(
+    gid: int,
+    date_str: str,
+) -> list[dict]:
+    """返回指定群当日全部用户发言（msg_type 100/321），按时间升序。
+
+    作为日报导出的数据源：包含目标成员当日发言 + 其他成员当日发言（上下文）。
+    每行 dict 含 mid/created_at/sender_id/sender_name/text/group_name。
+    """
+    start_ms, end_ms = _parse_date_to_day_range(date_str)
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT mid, created_at, sender_id, sender_name, text, group_name "
+        "FROM messages "
+        "WHERE gid=? AND created_at>=? AND created_at<? "
+        "AND msg_type IN (100, 321) "
+        "ORDER BY created_at ASC",
+        (gid, start_ms, end_ms),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def export_daily_report(
+    db_path: str,
+    gid: int,
+    date_str: str,
+    sender_name: str | None = None,
+    sender_id: int | None = None,
+    output_path: str | None = None,
+) -> dict:
+    """导出指定群+成员+日期的当日群聊上下文 CSV（用于 AI 生成成员日报）。
+
+    完整流程：初始化 DB → 解析目标 sender_id → 查询当日全部用户发言 →
+    标记 is_target → 查群名 → 写 CSV（utf-8-sig）。
+
+    CSV 四列：created_at(CST字符串), sender_name, text, is_target(1/0)。
+
+    返回结果字典:
+        {"path": str,           # 输出文件路径
+         "count": int,          # 当日消息总数
+         "target_count": int,   # 目标成员发言数
+         "context_count": int,  # 其他成员发言数（上下文）
+         "date": str,           # 日期字符串
+         "group_name": str,     # 群名
+         "target_sender_id": int|None,  # 目标成员 sender_id
+         "target_sender_name": str}     # 目标成员昵称（输入或由 sender_id 反查）
+    """
+    set_db_path(db_path)
+    init_db()
+
+    target_sid = _resolve_target_sender_id(gid, sender_name, sender_id)
+
+    rows = get_daily_context_messages(gid, date_str)
+
+    # 目标昵称：优先用输入；若仅传 sender_id 则反查最新昵称
+    target_sname = sender_name or ""
+    if not target_sname and target_sid:
+        for r in rows:
+            if r["sender_id"] == target_sid:
+                target_sname = r.get("sender_name") or ""
+                break
+        if not target_sname:
+            # 当日无发言，回退查历史最新昵称
+            conn = get_conn()
+            row = conn.execute(
+                "SELECT sender_name FROM messages "
+                "WHERE gid=? AND sender_id=? AND msg_type IN (100, 321) "
+                "ORDER BY created_at DESC LIMIT 1",
+                (gid, target_sid),
+            ).fetchone()
+            target_sname = row["sender_name"] if row else ""
+
+    # 标记 is_target 并组装 CSV 行
+    csv_rows = []
+    target_count = 0
+    for r in rows:
+        is_target = 1 if (target_sid is not None and r["sender_id"] == target_sid) else 0
+        if is_target:
+            target_count += 1
+        csv_rows.append({
+            "created_at": ms_to_cst(r.get("created_at")) or "",
+            "sender_name": r.get("sender_name") or "",
+            "text": r.get("text") or "",
+            "is_target": is_target,
+        })
+
+    # 查群名
+    group_name = ""
+    for g in get_group_list():
+        if g["gid"] == gid:
+            group_name = g.get("name", "")
+            break
+
+    # 确定输出路径
+    if not output_path:
+        sender_slug = target_sname or (str(target_sid) if target_sid else "member")
+        safe = "".join(c for c in sender_slug if c.isalnum() or c in "._-") or "member"
+        # 文件名中日期统一用 YYYY-MM-DD
+        date_slug = date_str.replace("/", "-")
+        output_path = str(
+            Path(__file__).resolve().parent.parent
+            / f"daily_{gid}_{safe}_{date_slug}.csv"
+        )
+
+    # 写 CSV（utf-8-sig，Excel 友好）
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["created_at", "sender_name", "text", "is_target"]
+        )
+        writer.writeheader()
+        for row in csv_rows:
+            writer.writerow(row)
+
+    context_count = len(csv_rows) - target_count
+    log.info(
+        "已导出日报 %d 条消息（目标 %d / 上下文 %d）→ %s",
+        len(csv_rows), target_count, context_count, output_path,
+    )
+
+    return {
+        "path": output_path,
+        "count": len(csv_rows),
+        "target_count": target_count,
+        "context_count": context_count,
+        "date": date_str,
+        "group_name": group_name,
+        "target_sender_id": target_sid,
+        "target_sender_name": target_sname,
+    }

@@ -317,6 +317,49 @@ def _do_export(db_path: str, gid: int, sender_name: str, sender_id: int,
         log.warning("未找到匹配的发言，请用 --list-members 核对成员标识与 --gid")
 
 
+def _do_daily_export(db_path: str, gid: int, date_str: str,
+                     sender_name: str, sender_id: int,
+                     output: str, log: logging.Logger):
+    """导出每日群聊日报 CSV（含当日群全部消息作为上下文，用于 AI 生成成员日报）。
+
+    参数校验后委托 weibo_im.export.export_daily_report 完成。
+    """
+    if not gid:
+        log.error("--daily 需要配合 --gid 指定群")
+        return
+    if not date_str:
+        log.error("--daily 需要配合 --date 指定日期（格式 YYYY-MM-DD）")
+        return
+    if not sender_name and not sender_id:
+        log.error("--daily 需要指定成员：--sender-name 或 --sender-id 至少给一个")
+        log.error("提示：用 --list-members --gid GID 查看群内成员昵称/ID")
+        return
+
+    from weibo_im.export import export_daily_report
+    try:
+        result = export_daily_report(
+            db_path=db_path, gid=gid, date_str=date_str,
+            sender_name=sender_name or None,
+            sender_id=sender_id or None,
+            output_path=output or None,
+        )
+    except ValueError as e:
+        log.error("日期解析失败: %s", e)
+        return
+
+    count = result["count"]
+    log.info("已导出日报 %d 条消息 → %s", count, result["path"])
+    log.info("群聊: %s", result["group_name"] or "(未知群)")
+    log.info("日期: %s", result["date"])
+    target_name = result["target_sender_name"] or "(未知)"
+    target_sid = result["target_sender_id"]
+    log.info("目标成员: %s (sender_id=%s)", target_name, target_sid if target_sid else "无")
+    log.info("  本人发言: %d 条", result["target_count"])
+    log.info("  上下文消息: %d 条", result["context_count"])
+    if result["target_count"] == 0:
+        log.warning("目标成员当日无发言，CSV 中 is_target 全为 0")
+
+
 def main():
     parser = argparse.ArgumentParser(description="微博群聊消息抓取（本地版）")
     parser.add_argument("--db", default="", help="数据库路径（默认 <项目>/weibo_im.db）")
@@ -366,6 +409,10 @@ def main():
                         help="--export 时输出紧凑（minified）JSON，去掉缩进与多余空白，减小文件体积")
     parser.add_argument("--format", choices=["json", "csv"], default="json",
                         help="--export 的输出格式：json（默认，纯数组）或 csv（表头 sender_name,text）")
+    parser.add_argument("--daily", action="store_true",
+                        help="导出每日群聊日报 CSV（含当日群全部消息作为上下文）；需配合 --gid --date --sender-name/--sender-id")
+    parser.add_argument("--date", default="",
+                        help="--daily 的日期，格式 YYYY-MM-DD 或 YYYY/MM/DD（CST 当日）")
     args = parser.parse_args()
 
     level = logging.DEBUG if args.verbose else logging.INFO
@@ -467,6 +514,11 @@ def main():
     if args.export:
         _do_export(db_path, args.gid, args.sender_name, args.sender_id,
                    args.since, args.until, args.output, args.compact, args.format, log)
+        return
+
+    if args.daily:
+        _do_daily_export(db_path, args.gid, args.date,
+                         args.sender_name, args.sender_id, args.output, log)
         return
 
     try:
