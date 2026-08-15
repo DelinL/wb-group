@@ -5,13 +5,16 @@
 """
 import argparse
 import calendar
+import csv
 import json
 import mimetypes
 import os
+import secrets
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -515,6 +518,81 @@ def _sync_status():
         }
 
 
+# ---------- 导出 token 管理 ----------
+
+# token → {"path": str, "created_at": float}；TTL 5 分钟。
+# 导出 API 写文件后注册 token，前端拿 token 走下载路由取文件，
+# 避免向前端暴露绝对路径，防止目录穿越攻击。
+_EXPORT_TOKENS: dict[str, dict] = {}
+_EXPORT_TOKEN_TTL = 300  # 秒
+_export_tokens_lock = threading.Lock()
+
+
+def _generate_export_token() -> str:
+    """生成 URL 安全的随机 token。"""
+    return secrets.token_urlsafe(16)
+
+
+def _register_export(path: str) -> str:
+    """注册导出文件路径，返回下载用 token。"""
+    token = _generate_export_token()
+    with _export_tokens_lock:
+        _EXPORT_TOKENS[token] = {"path": path, "created_at": time.time()}
+    return token
+
+
+def _resolve_export_token(token: str) -> str | None:
+    """校验 token：存在且未过期则返回文件路径，否则 None。
+
+    顺带清理过期 token，避免字典无限增长。
+    """
+    if not token:
+        return None
+    now = time.time()
+    with _export_tokens_lock:
+        # 清理过期 token
+        expired = [t for t, v in _EXPORT_TOKENS.items()
+                   if now - v["created_at"] > _EXPORT_TOKEN_TTL]
+        for t in expired:
+            _EXPORT_TOKENS.pop(t, None)
+        entry = _EXPORT_TOKENS.get(token)
+        if entry is None:
+            return None
+        if now - entry["created_at"] > _EXPORT_TOKEN_TTL:
+            _EXPORT_TOKENS.pop(token, None)
+            return None
+        return entry["path"]
+
+
+def _preview_export_file(path: str, fmt: str) -> list[dict]:
+    """读取导出文件前 50 条返回预览数据。
+
+    fmt="json"：解析 JSON 数组取前 50 条（每条 {sender_name, text}）。
+    fmt="csv"：用 csv.DictReader 读前 50 行（含 created_at/sender_name/text/is_target）。
+    解析失败返回空列表（不阻塞下载流程）。
+    """
+    PREVIEW_LIMIT = 50
+    try:
+        if fmt == "json":
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data[:PREVIEW_LIMIT]
+            return []
+        # csv
+        rows = []
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for i, row in enumerate(reader):
+                if i >= PREVIEW_LIMIT:
+                    break
+                # DictReader 返回的值可能是 None，统一转字符串
+                rows.append({k: (v if v is not None else "") for k, v in row.items()})
+        return rows
+    except Exception:
+        return []
+
+
 # ---------- HTTP Handler ----------
 
 class Handler(BaseHTTPRequestHandler):
@@ -572,6 +650,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._serve_static("index.html")
             return
+        if path == "/export.html":
+            self._serve_static("export.html")
+            return
         if path.startswith("/web/"):
             self._serve_static(path[len("/web/"):])
             return
@@ -583,6 +664,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_text("Not Found", status=404)
 
+    def _read_json_body(self):
+        """读取请求体并解析 JSON。失败抛 ValueError。"""
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise ValueError(f"请求体 JSON 解析失败: {e}")
+        return data if isinstance(data, dict) else {}
+
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -592,11 +687,174 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"error": "sync already running"}, status=409)
             return
+        if path == "/api/export/member":
+            self._handle_export_member()
+            return
+        if path == "/api/export/daily":
+            self._handle_export_daily()
+            return
         self._send_text("Not Found", status=404)
+
+    def _handle_export_member(self):
+        """POST /api/export/member — 成员发言导出。
+
+        body: {gid, sender_name?, sender_id?, since?, until?, fmt?, compact?}
+        since/until 为 'YYYY-MM-DD'，转 CST 当日 [start, end) 毫秒。
+        """
+        try:
+            body = self._read_json_body()
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        gid = body.get("gid")
+        if gid is None:
+            self._send_json({"error": "缺少必填参数 gid"}, status=400)
+            return
+        try:
+            gid = int(gid)
+        except (TypeError, ValueError):
+            self._send_json({"error": "gid 必须是整数"}, status=400)
+            return
+
+        sender_name = body.get("sender_name") or None
+        sender_id_raw = body.get("sender_id")
+        sender_id = None
+        if sender_id_raw not in (None, ""):
+            try:
+                sender_id = int(sender_id_raw)
+            except (TypeError, ValueError):
+                self._send_json({"error": "sender_id 必须是整数"}, status=400)
+                return
+        fmt = body.get("fmt") or "json"
+        if fmt not in ("json", "csv"):
+            self._send_json({"error": "fmt 必须是 json 或 csv"}, status=400)
+            return
+        compact = bool(body.get("compact", False))
+
+        since_ms = None
+        until_ms = None
+        since_str = body.get("since")
+        until_str = body.get("until")
+        try:
+            if since_str:
+                since_ms, _ = _cst_day_bounds(since_str)
+            if until_str:
+                # until 取当日全天：[start, 次日零点)
+                _, until_ms = _cst_day_bounds(until_str)
+        except Exception:
+            self._send_json({"error": "日期格式应为 YYYY-MM-DD"}, status=400)
+            return
+
+        # 至少要有 sender_name 或 sender_id 之一，避免误导出全群消息
+        if not sender_name and sender_id is None:
+            self._send_json(
+                {"error": "请至少指定 sender_name 或 sender_id 之一"},
+                status=400)
+            return
+
+        try:
+            from weibo_im.export import export_member_messages
+            result = export_member_messages(
+                db_path=self.db_path,
+                gid=gid,
+                sender_name=sender_name,
+                sender_id=sender_id,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                fmt=fmt,
+                compact=compact,
+            )
+        except Exception as e:
+            self._send_json({"error": f"导出失败: {e}"}, status=500)
+            return
+
+        preview = _preview_export_file(result["path"], fmt)
+        token = _register_export(result["path"])
+        filename = os.path.basename(result["path"])
+        self._send_json({
+            "path": filename,
+            "count": result["count"],
+            "start_cst": result["start_cst"],
+            "end_cst": result["end_cst"],
+            "group_name": result["group_name"],
+            "preview": preview,
+            "preview_total": len(preview),
+            "download_token": token,
+        })
+
+    def _handle_export_daily(self):
+        """POST /api/export/daily — 每日群聊日报导出。
+
+        body: {gid, date_str, sender_name?, sender_id?}
+        """
+        try:
+            body = self._read_json_body()
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        gid = body.get("gid")
+        if gid is None:
+            self._send_json({"error": "缺少必填参数 gid"}, status=400)
+            return
+        try:
+            gid = int(gid)
+        except (TypeError, ValueError):
+            self._send_json({"error": "gid 必须是整数"}, status=400)
+            return
+        date_str = body.get("date_str")
+        if not date_str:
+            self._send_json({"error": "缺少必填参数 date_str"}, status=400)
+            return
+
+        sender_name = body.get("sender_name") or None
+        sender_id_raw = body.get("sender_id")
+        sender_id = None
+        if sender_id_raw not in (None, ""):
+            try:
+                sender_id = int(sender_id_raw)
+            except (TypeError, ValueError):
+                self._send_json({"error": "sender_id 必须是整数"}, status=400)
+                return
+
+        try:
+            from weibo_im.export import export_daily_report
+            result = export_daily_report(
+                db_path=self.db_path,
+                gid=gid,
+                date_str=date_str,
+                sender_name=sender_name,
+                sender_id=sender_id,
+            )
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        except Exception as e:
+            self._send_json({"error": f"导出失败: {e}"}, status=500)
+            return
+
+        preview = _preview_export_file(result["path"], "csv")
+        token = _register_export(result["path"])
+        filename = os.path.basename(result["path"])
+        self._send_json({
+            "path": filename,
+            "count": result["count"],
+            "target_count": result["target_count"],
+            "context_count": result["context_count"],
+            "date": result["date"],
+            "group_name": result["group_name"],
+            "target_sender_id": result["target_sender_id"],
+            "target_sender_name": result["target_sender_name"],
+            "preview": preview,
+            "preview_total": len(preview),
+            "download_token": token,
+        })
 
     def _route_api(self, path, qs):
         if path == "/api/sync/status":
             self._send_json(_sync_status())
+            return
+        if path == "/api/export/download":
+            self._handle_export_download(qs)
             return
         conn = self.conn
         try:
@@ -651,6 +909,38 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not found"}, status=404)
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
+
+    def _handle_export_download(self, qs):
+        """GET /api/export/download?token=xxx — 凭 token 下载导出文件。
+
+        token 由 POST /api/export/* 注册，5 分钟内有效。校验通过后以
+        attachment 方式返回文件，触发浏览器下载。
+        """
+        token = qs.get("token", [""])[0]
+        path = _resolve_export_token(token)
+        if not path or not os.path.isfile(path):
+            self._send_json({"error": "token 无效或已过期"}, status=404)
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            self._send_json({"error": f"读取文件失败: {e}"}, status=500)
+            return
+        filename = os.path.basename(path)
+        # RFC 5987 编码文件名，支持中文
+        from urllib.parse import quote
+        filename_encoded = quote(filename)
+        ctype = _guess_content_type(path)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header(
+            "Content-Disposition",
+            f"attachment; filename=\"{filename_encoded}\"; "
+            f"filename*=UTF-8''{filename_encoded}")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _serve_static(self, rel):
         # 防目录穿越

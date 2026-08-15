@@ -25,6 +25,15 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 #sync-btn:hover:not(:disabled) { background: #5a6268; }
 #sync-btn:disabled { background: #adb5bd; cursor: not-allowed; }
 
+/* 顶栏导航链接按钮（如「数据导出」入口） */
+.nav-link-btn {
+  padding: 0 12px; height: 28px; cursor: pointer; background: #1a73e8; color: #fff;
+  border: none; border-radius: 4px; font-size: 13px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  text-decoration: none; transition: background .15s;
+}
+.nav-link-btn:hover { background: #1557b0; }
+
 /* 自动同步开关 + 倒计时圆环（参考 weiboblog） */
 .ar-toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; font-size: 13px; color: #666; }
 .ar-toggle input { display: none; }

@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,10 @@ from .db import set_db_path, init_db, get_conn, get_group_list
 
 CST = timezone(timedelta(hours=8))
 log = logging.getLogger("weibo_im.export")
+
+# 导出文件默认写入系统临时目录，避免污染项目目录。
+# 子目录名前缀 weibo_export_ 便于识别与批量清理。
+_EXPORT_DIR = Path(tempfile.gettempdir()) / "weibo_export"
 
 
 # ── 工具函数 ────────────────────────────────────────────────
@@ -165,6 +170,13 @@ def export_member_messages(
         until_ms=until_ms,
     )
 
+    # 过滤系统噪声（粉丝群提示、纯 URL 网页分享、"快来围观吧"自动提示）
+    total_before = len(rows)
+    rows = [r for r in rows if not _is_noise_message(r)]
+    filtered_count = total_before - len(rows)
+    if filtered_count:
+        log.info("过滤 %d 条噪声消息（粉丝群/纯URL/快来围观吧）", filtered_count)
+
     # 查群名称
     group_name = ""
     for g in get_group_list():
@@ -179,7 +191,8 @@ def export_member_messages(
         sender_slug = sname or (str(sid) if sid else "member")
         safe = "".join(c for c in sender_slug if c.isalnum() or c in "._-") or "member"
         ext = "csv" if fmt == "csv" else "json"
-        output_path = str(Path(__file__).resolve().parent.parent / f"export_{gid}_{safe}.{ext}")
+        _EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        output_path = str(_EXPORT_DIR / f"export_{gid}_{safe}.{ext}")
 
     if fmt == "csv":
         with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
@@ -197,7 +210,13 @@ def export_member_messages(
     start_cst = ms_to_cst(rows[0].get("created_at")) if rows else ""
     end_cst = ms_to_cst(rows[-1].get("created_at")) if rows else ""
 
-    log.info("已导出 %d 条发言 → %s", len(msgs), output_path)
+    if filtered_count:
+        log.info(
+            "已导出 %d 条发言（过滤噪声 %d 条）→ %s",
+            len(msgs), filtered_count, output_path,
+        )
+    else:
+        log.info("已导出 %d 条发言 → %s", len(msgs), output_path)
 
     return {
         "path": output_path,
@@ -298,6 +317,29 @@ def get_daily_context_messages(
     return [dict(r) for r in rows]
 
 
+def _is_noise_message(row: dict) -> bool:
+    """判断消息是否为应剔除的系统噪声。
+
+    规则：
+    - sender_name == "粉丝群" → 系统自动提示（如"恭喜…获得标识"、"涉及资金问题请务必提高警惕"等）
+    - text 去首尾空白后以 http:// 或 https:// 开头 → 纯 URL 网页分享（微博分享自动生成的纯链接）
+    - text 包含 "快来围观吧" → 微博分享时系统自动生成的提示（"我发布了新微博，快来围观吧！"）
+
+    返回 True 表示该条消息应被剔除。
+    """
+    sender_name = (row.get("sender_name") or "").strip()
+    if sender_name == "粉丝群":
+        return True
+    text = (row.get("text") or "").strip()
+    if not text:
+        return False
+    if text.startswith(("http://", "https://")):
+        return True
+    if "快来围观吧" in text:
+        return True
+    return False
+
+
 def export_daily_report(
     db_path: str,
     gid: int,
@@ -348,6 +390,13 @@ def export_daily_report(
             ).fetchone()
             target_sname = row["sender_name"] if row else ""
 
+    # 过滤系统噪声（粉丝群提示、纯 URL 网页分享、"快来围观吧"自动提示）
+    total_before = len(rows)
+    rows = [r for r in rows if not _is_noise_message(r)]
+    filtered_count = total_before - len(rows)
+    if filtered_count:
+        log.info("过滤 %d 条噪声消息（粉丝群/纯URL/快来围观吧）", filtered_count)
+
     # 标记 is_target 并组装 CSV 行
     csv_rows = []
     target_count = 0
@@ -375,9 +424,9 @@ def export_daily_report(
         safe = "".join(c for c in sender_slug if c.isalnum() or c in "._-") or "member"
         # 文件名中日期统一用 YYYY-MM-DD
         date_slug = date_str.replace("/", "-")
+        _EXPORT_DIR.mkdir(parents=True, exist_ok=True)
         output_path = str(
-            Path(__file__).resolve().parent.parent
-            / f"daily_{gid}_{safe}_{date_slug}.csv"
+            _EXPORT_DIR / f"daily_{gid}_{safe}_{date_slug}.csv"
         )
 
     # 写 CSV（utf-8-sig，Excel 友好）
@@ -390,10 +439,17 @@ def export_daily_report(
             writer.writerow(row)
 
     context_count = len(csv_rows) - target_count
-    log.info(
-        "已导出日报 %d 条消息（目标 %d / 上下文 %d）→ %s",
-        len(csv_rows), target_count, context_count, output_path,
-    )
+    if filtered_count:
+        log.info(
+            "已导出日报 %d 条消息（目标 %d / 上下文 %d，过滤噪声 %d 条）→ %s",
+            len(csv_rows), target_count, context_count,
+            filtered_count, output_path,
+        )
+    else:
+        log.info(
+            "已导出日报 %d 条消息（目标 %d / 上下文 %d）→ %s",
+            len(csv_rows), target_count, context_count, output_path,
+        )
 
     return {
         "path": output_path,
