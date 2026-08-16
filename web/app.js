@@ -774,7 +774,7 @@ async function silentRefresh() {
   } catch (e) { /* 静默失败 */ }
 }
 
-// ---------- 自动同步（每 60 秒，默认开启）----------
+// ---------- 自动同步（每 60 秒，默认不开启）----------
 const autoRefreshCheck = $("auto-refresh-check");
 const autoRefreshCountdown = $("auto-refresh-countdown");
 let autoRefreshTimer = null;
@@ -841,5 +841,4 @@ autoRefreshCheck.addEventListener("change", () => {
 });
 
 init();
-// 默认开启自动同步
-startAutoRefresh();
+// 默认不开启自动同步，由用户勾选触发

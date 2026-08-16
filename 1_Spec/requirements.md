@@ -1,3 +1,14 @@
+# 群聊导出 - 用于分析总结
+
+
+**Goal:** 爬取的群聊 `weibo_im.db` 资料我需要导出利用。将指定的群聊内容导出，用于总结梳理。
+
+专门做一个导出模块
+
+指定群
+指定群成员
+现在已经做到了
+
 现在我需要做一个生成每日群聊日报的功能：
 用户指定群聊、日期和成员，然后生成该成员当日的群聊总结日报，由已抓取的数据库 @c:\Users\Administrator\Downloads\Weibochat\jfjzsxh-weibogroup\weibo_im.db  
 
