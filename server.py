@@ -75,6 +75,10 @@ def _guess_content_type(path):
 
 _MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
 _fid_locks = {}
+
+# 与 crawl.py 中的 QRCODE_PATH 保持一致（<项目根>/qrcode.png），供 /qr/ 静态访问
+QRCODE_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qrcode.png")
+QRCODE_FILE_NAME = "qrcode.png"
 _fid_locks_guard = threading.Lock()
 
 
@@ -518,6 +522,120 @@ def _sync_status():
         }
 
 
+# ---------- Cookie 续期（长任务 + 轮询） ----------
+# 与同步同构：subprocess.Popen 跑 crawl.py --renew-cookie --headless，
+# 后台线程读其输出，并把截图出的二维码（<项目根>/qrcode.png）暴露给前端。
+# stage: idle | waiting_scan | scanning | done | failed
+_renew_state = {
+    "proc": None,
+    "exit_code": None,
+    "output": [],
+    "stage": "idle",
+    "qrcode_mtime": 0,
+}
+_renew_lock = threading.Lock()
+
+
+def _renew_worker(proc):
+    """后台线程：读续期子进程输出，推断 stage（等待扫码/成功/失败）。"""
+    lines = []
+    try:
+        for line in proc.stdout:
+            text = line.rstrip("\n")
+            lines.append(text)
+            if len(lines) > 200:
+                del lines[:-200]
+            stage = "waiting_scan"
+            if "二维码已截图" in text or "请用微博 APP 扫码" in text:
+                stage = "waiting_scan"
+            if "检测到扫码登录" in text or "已登录" in text or "已有有效 cookie" in text:
+                stage = "scanning"
+            with _renew_lock:
+                _renew_state["output"] = list(lines)
+                if _renew_state["stage"] in ("idle", "waiting_scan"):
+                    _renew_state["stage"] = stage
+    finally:
+        code = proc.wait()
+    # 进程退出后根据退出码定 stage
+    if code == 0:
+        final_stage = "done"
+    else:
+        final_stage = "failed"
+    with _renew_lock:
+        _renew_state["exit_code"] = code
+        _renew_state["output"] = lines[-200:]
+        _renew_state["stage"] = final_stage
+        _renew_state["proc"] = None
+
+
+def _start_renew():
+    """尝试启动 cookie 续期（无头截图二维码）。
+
+    返回 (ok, reason)：ok=False 时 reason 为 'running'（已有任务）或
+    'syncing'（同步在跑，需先等同步结束）。
+    """
+    with _renew_lock:
+        if _renew_state["proc"] is not None:
+            return False, "running"
+        # 与同步互斥：同步在跑时不允许启动续期
+        if _sync_state["proc"] is not None:
+            return False, "syncing"
+        # 注意：必须显式传 --headless，否则服务器无桌面环境会尝试弹窗失败
+        proc = subprocess.Popen(
+            [sys.executable, "crawl.py", "--renew-cookie", "--headless"],
+            cwd=_PROJECT_DIR,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        _renew_state["proc"] = proc
+        _renew_state["exit_code"] = None
+        _renew_state["output"] = []
+        _renew_state["stage"] = "idle"
+        _renew_state["qrcode_mtime"] = 0
+    threading.Thread(target=_renew_worker, args=(proc,), daemon=True).start()
+    return True, ""
+
+
+def _renew_status():
+    """返回续期状态；qrcode_url 仅在二维码文件存在时给出（带 mtime 防缓存）。"""
+    with _renew_lock:
+        running = _renew_state["proc"] is not None
+        stage = _renew_state["stage"]
+        exit_code = _renew_state["exit_code"]
+        qrcode_mtime = _renew_state["qrcode_mtime"]
+    qrcode_url = None
+    if os.path.isfile(QRCODE_IMAGE_PATH):
+        try:
+            mtime = os.path.getmtime(QRCODE_IMAGE_PATH)
+        except OSError:
+            mtime = 0
+        # 仅当 mtime 变化时更新（避免前端无谓重绘）
+        if mtime and mtime != qrcode_mtime:
+            with _renew_lock:
+                _renew_state["qrcode_mtime"] = mtime
+            qrcode_url = f"/qr/{QRCODE_FILE_NAME}?t={int(mtime)}"
+    return {
+        "running": running,
+        "stage": stage,
+        "exit_code": exit_code,
+        "output": "\n".join(_renew_state["output"]),
+        "qrcode_url": qrcode_url,
+    }
+
+
+def _stop_renew():
+    """终止续期子进程（SIGINT，与同步同款）。"""
+    with _renew_lock:
+        proc = _renew_state["proc"]
+    if proc is not None:
+        try:
+            os.kill(proc.pid, 2)  # SIGINT
+        except ProcessLookupError:
+            pass
+
+
 # ---------- 导出 token 管理 ----------
 
 # token → {"path": str, "created_at": float}；TTL 5 分钟。
@@ -642,6 +760,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_file(full)
 
+    def _serve_qr_static(self, path):
+        """服务续期二维码图片（仅允许项目根下的 qrcode.png，防目录穿越）。"""
+        name = path[len("/qr/"):].replace("\\", "/").lstrip("/")
+        # 仅允许固定文件名，杜绝任意路径访问
+        if name != QRCODE_FILE_NAME:
+            self._send_text("Forbidden", status=403)
+            return
+        full = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), name))
+        if not os.path.isfile(full):
+            self._send_text("Not Found", status=404)
+            return
+        self._send_file(full)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -658,6 +789,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/media/"):
             self._serve_media_static(path)
+            return
+        if path.startswith("/qr/"):
+            self._serve_qr_static(path)
             return
         if path.startswith("/api/"):
             self._route_api(path, qs)
@@ -686,6 +820,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"status": "started"}, status=202)
             else:
                 self._send_json({"error": "sync already running"}, status=409)
+            return
+        if path == "/api/renew":
+            ok, reason = _start_renew()
+            if ok:
+                self._send_json({"status": "started"}, status=202)
+            elif reason == "syncing":
+                self._send_json({"error": "同步任务进行中，请等待同步完成后再续期"}, status=409)
+            else:
+                self._send_json({"error": "续期任务已在运行"}, status=409)
+            return
+        if path == "/api/renew/stop":
+            _stop_renew()
+            self._send_json({"status": "stopped"})
             return
         if path == "/api/export/member":
             self._handle_export_member()
@@ -852,6 +999,9 @@ class Handler(BaseHTTPRequestHandler):
     def _route_api(self, path, qs):
         if path == "/api/sync/status":
             self._send_json(_sync_status())
+            return
+        if path == "/api/renew/status":
+            self._send_json(_renew_status())
             return
         if path == "/api/export/download":
             self._handle_export_download(qs)
