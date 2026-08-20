@@ -63,6 +63,7 @@ def get_member_messages(
     sender_name: str | None = None,
     since_ms: int | None = None,
     until_ms: int | None = None,
+    since_mid: str | None = None,
     msg_types: tuple[int, ...] = (100, 321),
 ) -> list[dict]:
     """返回指定群内某成员本人发言（默认普通消息 321 + 微博分享 100），按时间升序。
@@ -71,6 +72,8 @@ def get_member_messages(
       优先用 sender_id（稳定），sender_name 便于按可感知昵称导出。
     - since_ms/until_ms 为 created_at 毫秒范围：since 闭区间 (>=)、until 开区间 (<)，
       与项目内 CST 日期区间 [start, end) 约定一致。
+    - since_mid 为增量水位线：只取 mid 严格大于此值的消息（mid 为字符串，字典序比较
+      等价于时间顺序，见 API.md §7.5）。用于"只导出知识库未收录的新消息"。
     - msg_types 默认 (100, 321)；传空元组则不加该过滤（一般不必要）。
 
     返回每行 dict（含 mid/gid/msg_type/msg_type_name/media_type/sender_id/
@@ -96,6 +99,10 @@ def get_member_messages(
     if until_ms is not None:
         conds.append("created_at<?")
         params.append(until_ms)
+    if since_mid:
+        # mid 存为 TEXT，字典序比较等价于时间顺序（同长数字串）
+        conds.append("mid>?")
+        params.append(str(since_mid))
     sql = (
         "SELECT mid, gid, msg_type, msg_type_name, media_type, "
         "sender_id, sender_name, text, fid, media_orig_url, "
@@ -110,12 +117,40 @@ def get_member_messages(
 # ── JSON 组装 ───────────────────────────────────────────────
 
 
-def build_export_json(rows: list[dict]) -> list[dict]:
+def build_export_json(rows: list[dict], with_meta: bool = False, slim: bool = False) -> list[dict]:
     """将查询结果组装为适合 AI 分析的导出数据。
 
-    返回消息列表，每条仅含 sender_name（发言者昵称）与 text（正文）两项，
+    三种输出形态（按用途选择）：
+    - 默认：每条含 sender_name / text 两项，聚焦发言内容。
+    - with_meta=True：额外带 mid / created_at，含完整审计信息（本地核验用，
+      **不建议上传知识库**——mid 是 18 位无意义数字，浪费 AI token）。
+    - slim=True：仅 created_at / text 两项。用于上传知识库：保留时间线（宏观
+      策略时效性必需），去掉 mid 与冗余 sender_name（单成员导出时 sender 全相同），
+      体积比 with_meta 小约 40%。
+
+    水位线（max_mid）追踪与文件列无关：export_member_messages 总会返回本批 max_mid，
+    由调用方写回 .watermark.json，因此上传文件无需含 mid 列。
+
     按 created_at ASC 排列，契合按时间线的 AI 序列分析。
     """
+    if with_meta:
+        return [
+            {
+                "mid": str(r.get("mid") or ""),
+                "created_at": ms_to_cst(r.get("created_at")) or "",
+                "sender_name": r.get("sender_name") or "",
+                "text": r.get("text") or "",
+            }
+            for r in rows
+        ]
+    if slim:
+        return [
+            {
+                "created_at": ms_to_cst(r.get("created_at")) or "",
+                "text": r.get("text") or "",
+            }
+            for r in rows
+        ]
     return [
         {
             "sender_name": r.get("sender_name") or "",
@@ -123,6 +158,43 @@ def build_export_json(rows: list[dict]) -> list[dict]:
         }
         for r in rows
     ]
+
+
+# ── 水位线（增量导出游标）─────────────────────────────────
+
+
+def _read_watermark(path: str) -> str | None:
+    """从水位线文件读取上次已成功上传到知识库的 max_mid。
+
+    文件格式: ``{"max_mid": "...", "updated_at": "...", "note": "..."}``。
+    文件不存在或损坏返回 None（视为全量导出）。用于 --watermark-file 自动续跑。
+    """
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        mid = data.get("max_mid")
+        return str(mid) if mid else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_watermark(path: str, max_mid: str, *, note: str = "") -> None:
+    """上传成功后推进水位线。
+
+    在确认本批导出已成功入库知识库后调用，把 max_mid 写回水位线文件；
+    下次导出会从该值之后取增量。**上传失败时不要调用**，否则会漏数据。
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "max_mid": str(max_mid),
+        "updated_at": datetime.now(tz=CST).strftime("%Y-%m-%d %H:%M:%S"),
+        "note": note,
+    }
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    log.info("水位线已推进: max_mid=%s → %s", max_mid, path)
 
 
 # ── 高级编排（含 DB 初始化 + 文件写入）─────────────────────
@@ -138,23 +210,30 @@ def export_member_messages(
     output_path: str | None = None,
     compact: bool = False,
     fmt: str = "json",
+    since_mid: str | None = None,
+    with_meta: bool = False,
+    slim: bool = False,
+    watermark_file: str | None = None,
 ) -> dict:
     """导出指定群内某成员本人发言为文件（JSON 或 CSV）。
 
     完整流程：初始化 DB 连接 → 查询消息 → 查询群名 → 组装数据 → 写入文件。
 
-    fmt="json"（默认）：输出纯 JSON 数组，每条含 sender_name / text 两项。
-        compact=True 时进一步输出紧凑（minified）JSON（去缩进、去空格），
-        显著减小体积，适合直接喂大模型或网络传输；否则保留 2 空格缩进便于阅读。
-    fmt="csv"：输出 CSV 文件，表头为 sender_name,text（UTF-8-SIG 编码，
-        Excel 可直接打开且中文不乱码）；compact 参数对 CSV 无影响。
+    增量导出（水位线）：
+      - since_mid：只导出 mid 严格大于此值的消息（知识库未收录的新消息）。
+      - watermark_file：未显式给 since_mid 时，从此文件读取 max_mid 作为水位线；
+        文件不存在则全量导出（首次运行）。
+      - 返回结果含 max_mid（本批已去噪导出的最大 mid），上传成功后用
+        write_watermark 写回水位线文件，下次自动续跑。
+
+    fmt="json"（默认）：输出纯 JSON 数组，每条含 sender_name / text 两项
+        （with_meta=True 时额外带 mid / created_at）。compact=True 输出紧凑 JSON。
+    fmt="csv"：CSV 文件，with_meta=False 表头 sender_name,text；with_meta=True
+        表头 mid,created_at,sender_name,text（UTF-8-SIG，Excel 友好）。
 
     返回结果字典:
-        {"path": str,          # 输出文件路径
-         "count": int,         # 导出条数
-         "start_cst": str,     # 最早消息时间
-         "end_cst": str,       # 最晚消息时间
-         "group_name": str}    # 群名称
+        {"path": str, "count": int, "start_cst": str, "end_cst": str,
+         "group_name": str, "max_mid": str, "since_mid": str}
     """
     set_db_path(db_path)
     init_db()
@@ -162,12 +241,22 @@ def export_member_messages(
     sid = sender_id if sender_id else None
     sname = sender_name or None
 
+    # 水位线解析：显式 since_mid 优先；否则从 watermark_file 读取
+    effective_since_mid = since_mid
+    if not effective_since_mid and watermark_file:
+        effective_since_mid = _read_watermark(watermark_file)
+        if effective_since_mid:
+            log.info("从水位线文件读取基线 max_mid=%s", effective_since_mid)
+        else:
+            log.info("水位线文件不存在或为空，将全量导出（首次运行）")
+
     rows = get_member_messages(
         gid=gid,
         sender_id=sid,
         sender_name=sname,
         since_ms=since_ms,
         until_ms=until_ms,
+        since_mid=effective_since_mid,
     )
 
     # 过滤系统噪声（粉丝群提示、纯 URL 网页分享、"快来围观吧"自动提示）
@@ -184,7 +273,7 @@ def export_member_messages(
             group_name = g.get("name", "")
             break
 
-    msgs = build_export_json(rows)
+    msgs = build_export_json(rows, with_meta=with_meta, slim=slim)
 
     # 确定输出路径（CSV 用 .csv 扩展名）
     if not output_path:
@@ -195,11 +284,17 @@ def export_member_messages(
         output_path = str(_EXPORT_DIR / f"export_{gid}_{safe}.{ext}")
 
     if fmt == "csv":
+        if with_meta:
+            fieldnames = ["mid", "created_at", "sender_name", "text"]
+        elif slim:
+            fieldnames = ["created_at", "text"]
+        else:
+            fieldnames = ["sender_name", "text"]
         with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["sender_name", "text"])
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for m in msgs:
-                writer.writerow(m)
+                writer.writerow({k: m.get(k, "") for k in fieldnames})
     else:
         with open(output_path, "w", encoding="utf-8") as f:
             if compact:
@@ -209,6 +304,8 @@ def export_member_messages(
 
     start_cst = ms_to_cst(rows[0].get("created_at")) if rows else ""
     end_cst = ms_to_cst(rows[-1].get("created_at")) if rows else ""
+    # 本批导出（已去噪）的最大 mid；上传成功后用 write_watermark 推进水位线
+    max_mid = max((str(r.get("mid") or "") for r in rows), default="")
 
     if filtered_count:
         log.info(
@@ -224,6 +321,8 @@ def export_member_messages(
         "start_cst": start_cst,
         "end_cst": end_cst,
         "group_name": group_name,
+        "max_mid": max_mid,
+        "since_mid": effective_since_mid or "",
     }
 
 
@@ -460,4 +559,193 @@ def export_daily_report(
         "group_name": group_name,
         "target_sender_id": target_sid,
         "target_sender_name": target_sname,
+    }
+
+
+# ── 增量对比（两个导出数据包求差集）────────────────────────
+
+
+def _detect_format(filename: str, text: str) -> str:
+    """检测文件格式：json 或 csv。优先扩展名，兜底看内容首字符。"""
+    lower = (filename or "").lower()
+    if lower.endswith(".json"):
+        return "json"
+    if lower.endswith(".csv"):
+        return "csv"
+    trimmed = text.lstrip()
+    if trimmed.startswith(("[", "{")):
+        return "json"
+    return "csv"
+
+
+def _parse_export_text(filename: str, text: str) -> list[dict]:
+    """把导出文件文本解析为 [{sender_name, text}, ...] 数组。
+
+    支持 JSON 数组 与 CSV（表头 sender_name,text，utf-8-sig 兼容）。
+    """
+    fmt = _detect_format(filename, text)
+    if fmt == "json":
+        data = json.loads(text)
+        if not isinstance(data, list):
+            raise ValueError("JSON 文件不是数组格式")
+        return [{"sender_name": str(m.get("sender_name", "")),
+                 "text": str(m.get("text", ""))} for m in data]
+    return _parse_export_csv(text)
+
+
+def _parse_export_csv(text: str) -> list[dict]:
+    """轻量 CSV 解析：支持 BOM、引号包裹、字段内逗号/换行/引号转义。
+
+    仅取前两个字段 sender_name, text；跳过表头（含 sender_name）。
+    """
+    if text and text[0] == "\ufeff":
+        text = text[1:]
+    rows: list[list[str]] = []
+    i, n = 0, len(text)
+    field, row, in_quotes = "", [], False
+    while i < n:
+        c = text[i]
+        if in_quotes:
+            if c == '"':
+                if i + 1 < n and text[i + 1] == '"':
+                    field += '"'
+                    i += 2
+                    continue
+                in_quotes = False
+                i += 1
+                continue
+            if c == "\r" and i + 1 < n and text[i + 1] == "\n":
+                field += "\n"
+                i += 2
+                continue
+            field += c
+            i += 1
+            continue
+        if c == '"':
+            in_quotes = True
+            i += 1
+            continue
+        if c == ",":
+            row.append(field)
+            field = ""
+            i += 1
+            continue
+        if c == "\r":
+            i += 1
+            continue
+        if c == "\n":
+            row.append(field)
+            field = ""
+            if row and not (len(row) == 1 and row[0] == ""):
+                rows.append(row)
+            row = []
+            i += 1
+            continue
+        field += c
+        i += 1
+    if field != "" or row:
+        row.append(field)
+        if row and not (len(row) == 1 and row[0] == ""):
+            rows.append(row)
+
+    start = 0
+    if rows and len(rows[0]) >= 2 and "sender_name" in rows[0][0].lower():
+        start = 1
+    result = []
+    for r in rows[start:]:
+        if len(r) < 2:
+            continue
+        result.append({"sender_name": r[0], "text": r[1]})
+    return result
+
+
+def compute_delta(old_rows: list[dict], new_rows: list[dict]) -> list[dict]:
+    """组合键差集：返回新包有但旧包没有的消息。
+
+    去重键 = (sender_name, text, 出现序号)。旧包建 baseKey->count 映射，
+    新包按序消费配额，超出部分即为新增（正确处理"同文本多发多次"）。
+    """
+    old_counts: dict[tuple[str, str], int] = {}
+    for r in old_rows:
+        base = (r["sender_name"], r["text"])
+        old_counts[base] = old_counts.get(base, 0) + 1
+    cursor: dict[tuple[str, str], int] = {}
+    delta = []
+    for r in new_rows:
+        base = (r["sender_name"], r["text"])
+        used = cursor.get(base, 0)
+        limit = old_counts.get(base, 0)
+        if used < limit:
+            cursor[base] = used + 1
+        else:
+            delta.append(r)
+    return delta
+
+
+def diff_export_files(
+    old_path: str,
+    new_path: str,
+    output_path: str | None = None,
+    fmt: str = "json",
+) -> dict:
+    """对比两个导出数据包，输出新增消息的补充包。
+
+    读取旧包（上次导出）与新包（本次导出），以 (sender_name, text, 出现序号)
+    组合键求差集，得到新包有而旧包没有的增量消息。结果写入补充包文件，
+    格式与 --export 一致（json/csv），可直接上传 NotebookLM。
+
+    参数:
+        old_path: 旧数据包路径
+        new_path: 新数据包路径
+        output_path: 输出路径（默认 系统临时目录/delta_<时间戳>.<ext>）
+        fmt: 输出格式 json（默认）或 csv
+
+    返回:
+        {"old_count", "new_count", "delta_count", "dup_count",
+         "same_sender", "path"}
+    """
+    old_text = Path(old_path).read_text(encoding="utf-8-sig")
+    new_text = Path(new_path).read_text(encoding="utf-8-sig")
+
+    old_rows = _parse_export_text(old_path, old_text)
+    new_rows = _parse_export_text(new_path, new_text)
+
+    # 前 10 条 sender_name 核对（同一份导出文件里发言者通常一致）
+    k = min(10, len(old_rows), len(new_rows))
+    old_top = [r["sender_name"] for r in old_rows[:k]]
+    new_top = [r["sender_name"] for r in new_rows[:k]]
+    same_sender = old_top == new_top
+
+    delta = compute_delta(old_rows, new_rows)
+
+    if not output_path:
+        ts = datetime.now(tz=CST)
+        stamp = ts.strftime("%Y%m%d_%H%M")
+        _EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        output_path = str(_EXPORT_DIR / f"delta_{stamp}.{fmt}")
+
+    if fmt == "csv":
+        with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["sender_name", "text"])
+            writer.writeheader()
+            for m in delta:
+                writer.writerow(m)
+    else:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(delta, f, ensure_ascii=False, indent=2)
+
+    log.info("旧包: %d 条 | 新包: %d 条 | 新增: %d 条 | 重复: %d 条",
+             len(old_rows), len(new_rows), len(delta),
+             len(new_rows) - len(delta))
+    if not same_sender:
+        log.warning("两包前 10 条发言者不一致，请确认是同一群同一成员")
+    log.info("补充包已写入: %s", output_path)
+
+    return {
+        "old_count": len(old_rows),
+        "new_count": len(new_rows),
+        "delta_count": len(delta),
+        "dup_count": len(new_rows) - len(delta),
+        "same_sender": same_sender,
+        "path": output_path,
     }

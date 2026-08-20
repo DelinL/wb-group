@@ -17,6 +17,8 @@
     python crawl.py --check-playwright                 # 检查 Playwright 环境就绪
     python crawl.py --stats                            # 打印数据库统计
     python crawl.py --search 关键词                    # 全文搜索消息
+    python crawl.py --diff --old 旧包.json --new 新包.json          # 对比两个导出包，输出新增补充包
+    python crawl.py --diff --old old.csv --new new.csv --diff-format csv -O delta.csv  # 指定格式与输出路径
 
 扫码登录流程（--renew-cookie）：
     程序优先调用本机已安装的 Chrome（Google Chrome）打开微博扫码页；若本机
@@ -374,10 +376,18 @@ def _do_list_members(db_path: str, gid: int, log: logging.Logger):
 
 
 def _do_export(db_path: str, gid: int, sender_name: str, sender_id: int,
-               since: str, until: str, output: str, compact: bool, fmt: str, log: logging.Logger):
+               since: str, until: str, output: str, compact: bool, fmt: str, log: logging.Logger,
+               since_mid: str = "", with_meta: bool = False, slim: bool = False,
+               watermark_file: str = ""):
     """导出指定群内某成员本人发言为文件（JSON 或 CSV，用于 AI 分析）。
 
     参数校验后委托 weibo_im.export 模块完成 DB 查询、数据组装、文件写入。
+
+    增量导出（水位线）：
+      - since_mid：只导出 mid 大于此值的消息（知识库未收录的新消息）。
+      - watermark_file：未给 since_mid 时从此文件读取 max_mid 自动续跑。
+      - with_meta：输出带 mid + created_at 列，便于本地核验（不建议上传知识库，mid 浪费 token）。
+      - slim：输出 created_at,text 两列，上传知识库推荐用此格式（体积小、保留时间线）。
     """
     if not gid:
         log.error("--export 需要配合 --gid 指定群")
@@ -399,6 +409,10 @@ def _do_export(db_path: str, gid: int, sender_name: str, sender_id: int,
         output_path=output or None,
         compact=compact,
         fmt=fmt,
+        since_mid=since_mid or None,
+        with_meta=with_meta,
+        slim=slim,
+        watermark_file=watermark_file or None,
     )
 
     count = result["count"]
@@ -406,6 +420,8 @@ def _do_export(db_path: str, gid: int, sender_name: str, sender_id: int,
     log.info("已导出 %d 条发言 → %s", count, output_path)
     if count:
         log.info("时间范围: %s ~ %s (CST)", result["start_cst"], result["end_cst"])
+        if result.get("max_mid"):
+            log.info("本批最大 mid: %s（上传成功后用此值推进水位线）", result["max_mid"])
     else:
         log.warning("未找到匹配的发言，请用 --list-members 核对成员标识与 --gid")
 
@@ -451,6 +467,41 @@ def _do_daily_export(db_path: str, gid: int, date_str: str,
     log.info("  上下文消息: %d 条", result["context_count"])
     if result["target_count"] == 0:
         log.warning("目标成员当日无发言，CSV 中 is_target 全为 0")
+
+
+def _do_diff(old_path: str, new_path: str, output: str, fmt: str, log: logging.Logger):
+    """对比两个导出数据包，输出新增消息的补充包（用于增量更新 NotebookLM 等）。
+
+    委托 weibo_im.export.diff_export_files 完成文件解析（JSON/CSV 自适应）、
+    组合键差集（sender_name+text+出现序号）、补充包写出。
+    """
+    if not old_path:
+        log.error("--diff 需要配合 --old 指定旧数据包路径")
+        return
+    if not new_path:
+        log.error("--diff 需要配合 --new 指定新数据包路径")
+        return
+    from weibo_im.export import diff_export_files
+    try:
+        result = diff_export_files(
+            old_path=old_path,
+            new_path=new_path,
+            output_path=output or None,
+            fmt=fmt,
+        )
+    except FileNotFoundError as e:
+        log.error("文件不存在: %s", e)
+        return
+    except (ValueError, OSError) as e:
+        log.error("文件解析失败: %s", e)
+        return
+    log.info("对比完成：旧=%d 新=%d 新增=%d 重复=%d → %s",
+             result["old_count"], result["new_count"],
+             result["delta_count"], result["dup_count"], result["path"])
+    if not result["same_sender"]:
+        log.warning("两包前 10 条发言者不一致，请确认是同一群同一成员")
+    if result["delta_count"] == 0:
+        log.info("无新增消息")
 
 
 def main():
@@ -510,6 +561,24 @@ def main():
                         help="导出每日群聊日报 CSV（含当日群全部消息作为上下文）；需配合 --gid --date --sender-name/--sender-id")
     parser.add_argument("--date", default="",
                         help="--daily 的日期，格式 YYYY-MM-DD 或 YYYY/MM/DD（CST 当日）")
+    parser.add_argument("--diff", action="store_true",
+                        help="对比两个导出数据包，输出新增消息的补充包；需配合 --old / --new")
+    parser.add_argument("--old", default="",
+                        help="--diff 的旧数据包路径（上次导出）")
+    parser.add_argument("--new", default="",
+                        help="--diff 的新数据包路径（本次导出）")
+    parser.add_argument("--diff-format", choices=["json", "csv"], default="json",
+                        help="--diff 补充包输出格式（默认 json，与 --export 一致）")
+    parser.add_argument("--diff-output", "-O", default="",
+                        help="--diff 补充包输出路径（默认 系统临时目录/delta_<时间戳>.<ext>）")
+    parser.add_argument("--since-mid", default="",
+                        help="--export 时只导出 mid 大于此值的消息（增量导出，配合水位线使用）")
+    parser.add_argument("--with-meta", action="store_true",
+                        help="--export 时输出带 mid 与 created_at 列（本地核验用，不建议上传知识库）")
+    parser.add_argument("--slim", action="store_true",
+                        help="--export 时输出 created_at,text 两列（上传知识库推荐：体积小、保留时间线、去冗余）")
+    parser.add_argument("--watermark-file", default="",
+                        help="--export 时从此文件读取 max_mid 作为 --since-mid（文件不存在则全量导出）")
     args = parser.parse_args()
 
     level = logging.DEBUG if args.verbose else logging.INFO
@@ -611,12 +680,18 @@ def main():
 
     if args.export:
         _do_export(db_path, args.gid, args.sender_name, args.sender_id,
-                   args.since, args.until, args.output, args.compact, args.format, log)
+                   args.since, args.until, args.output, args.compact, args.format, log,
+                   since_mid=args.since_mid, with_meta=args.with_meta,
+                   slim=args.slim, watermark_file=args.watermark_file)
         return
 
     if args.daily:
         _do_daily_export(db_path, args.gid, args.date,
                          args.sender_name, args.sender_id, args.output, log)
+        return
+
+    if args.diff:
+        _do_diff(args.old, args.new, args.diff_output, args.diff_format, log)
         return
 
     try:
