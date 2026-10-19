@@ -27,9 +27,18 @@ def get_conn() -> sqlite3.Connection:
     if not hasattr(_local, "conn") or _local.conn is None:
         if not _DB_PATH:
             raise RuntimeError("DB path not set")
-        conn = sqlite3.connect(_DB_PATH)
+        # timeout：多线程下载媒体时并发写库，等锁而不是立刻抛 locked
+        conn = sqlite3.connect(_DB_PATH, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        # WAL 下 NORMAL 不会损坏库，只是断电可能丢最后一批事务。
+        # 爬取可重跑（按 mid 去重），用持久性换掉每次 commit 的 fsync。
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        # 64 MB 页缓存 + 临时表放内存，避免大范围聚合落盘
+        conn.execute("PRAGMA cache_size=-65536")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA mmap_size=268435456")
         conn.execute("PRAGMA foreign_keys=ON")
         _local.conn = conn
     return _local.conn
@@ -154,6 +163,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_msg_ctime ON messages(created_at);
         CREATE INDEX IF NOT EXISTS idx_msg_mid   ON messages(mid);
         CREATE INDEX IF NOT EXISTS idx_msg_fid   ON messages(fid);
+        -- 复合索引：按群分页 / 按月日聚合 / 群内搜索 / 取最新 mid 都走它，
+        -- 免去「先扫 gid 索引再回表 + 排序」（大库上从秒级降到几十毫秒）
+        CREATE INDEX IF NOT EXISTS idx_msg_gid_ctime ON messages(gid, created_at);
+        -- 成员列表（按 sender 聚合）的覆盖索引，避免逐行回表
+        CREATE INDEX IF NOT EXISTS idx_msg_member
+            ON messages(gid, msg_type, sender_id, created_at, sender_name);
         CREATE INDEX IF NOT EXISTS idx_mf_fid    ON media_files(fid);
         CREATE INDEX IF NOT EXISTS idx_mf_status ON media_files(status);
 
@@ -182,6 +197,32 @@ def init_db():
         END;
     """)
     conn.commit()
+
+    # 老库里 min_mid/max_mid 可能为空但有历史消息：一次性补齐，
+    # 否则后续增量维护范围会把范围算窄，导致重复回填。
+    _backfill_group_ranges(conn)
+
+
+def _backfill_group_ranges(conn) -> int:
+    """为 min_mid/max_mid 为空的群从 messages 表补齐范围，返回修复的群数"""
+    try:
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM groups "
+            "WHERE min_mid IS NULL OR min_mid='' OR max_mid IS NULL OR max_mid=''"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0
+    if not pending:
+        return 0
+    conn.execute("""
+        UPDATE groups SET
+            min_mid = COALESCE((SELECT MIN(mid) FROM messages WHERE gid=groups.gid), ''),
+            max_mid = COALESCE((SELECT MAX(mid) FROM messages WHERE gid=groups.gid), '')
+        WHERE min_mid IS NULL OR min_mid='' OR max_mid IS NULL OR max_mid=''
+    """)
+    conn.commit()
+    log.info("已补齐 %d 个群的 min_mid/max_mid 范围", pending)
+    return pending
 
 
 # ── 配置读写 ──────────────────────────────────────────────
@@ -296,74 +337,128 @@ def save_groups(groups: list[dict]) -> int:
     return count
 
 
-def _update_group_mid(conn, gid: int, mid: str):
-    """更新群的 min_mid / max_mid 范围"""
-    conn.execute("""
+def _update_group_mid(conn, gid: int, mids: list[str]) -> int:
+    """用一批 mid 增量维护群的 min_mid / max_mid 范围，返回受影响行数
+    （0 表示 groups 表里没有这个群，需要调用方回退到全量刷新）"""
+    mids = [m for m in mids if m]
+    if not mids:
+        return 0
+    lo, hi = min(mids), max(mids)
+    cursor = conn.execute("""
         UPDATE groups SET
             min_mid = CASE
-                WHEN min_mid = '' OR min_mid > ? THEN ?
+                WHEN min_mid IS NULL OR min_mid = '' OR min_mid > ? THEN ?
                 ELSE min_mid
             END,
             max_mid = CASE
-                WHEN max_mid = '' OR max_mid < ? THEN ?
+                WHEN max_mid IS NULL OR max_mid = '' OR max_mid < ? THEN ?
                 ELSE max_mid
             END
         WHERE gid = ?
-    """, (mid, mid, mid, mid, gid))
+    """, (lo, lo, hi, hi, gid))
+    return cursor.rowcount
+
+
+_INSERT_MSG_SQL = """
+    INSERT OR IGNORE INTO messages
+        (mid, gid, msg_type, msg_type_name, media_type,
+         sender_id, sender_name, text,
+         fid, media_orig_url, media_local_path,
+         url_objects, pic_infos,
+         template, template_data,
+         recall_mids, recall_by,
+         attitude_data,
+         faith_status, faith_icon, group_name, annotations,
+         created_at, saved_at, raw_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def _msg_row(msg: dict, saved_at: int) -> tuple:
+    return (
+        msg["mid"],
+        msg.get("gid", 0),
+        msg.get("msg_type", 321),
+        msg.get("msg_type_name", ""),
+        msg.get("media_type", 0),
+        msg.get("sender_id", 0),
+        msg.get("sender_name", ""),
+        msg.get("text", ""),
+        msg.get("fid", ""),
+        msg.get("media_orig_url", ""),
+        msg.get("media_local_path", ""),
+        msg.get("url_objects", ""),
+        msg.get("pic_infos", ""),
+        msg.get("template", ""),
+        msg.get("template_data", "{}"),
+        msg.get("recall_mids", "[]"),
+        msg.get("recall_by", ""),
+        msg.get("attitude_data", "{}"),
+        msg.get("faith_status", 0),
+        msg.get("faith_icon", ""),
+        msg.get("group_name", ""),
+        msg.get("annotations", "{}"),
+        int(msg.get("created_at", 0)),
+        saved_at,
+        msg.get("raw_json", ""),
+    )
+
+
+def _existing_mids(conn, mids: list[str]) -> set[str]:
+    """批量查询已存在的 mid（分块避开 SQLite 变量上限）"""
+    found: set[str] = set()
+    for i in range(0, len(mids), 400):
+        chunk = mids[i:i + 400]
+        placeholders = ",".join("?" * len(chunk))
+        found.update(
+            r[0] for r in conn.execute(
+                f"SELECT mid FROM messages WHERE mid IN ({placeholders})", chunk
+            )
+        )
+    return found
+
+
+def save_messages(msgs: list[dict]) -> list[dict]:
+    """批量保存消息（单事务），返回真正新增的消息列表。
+
+    一次页面 50 条只提交 1 次，而不是逐条 commit + fsync。
+    """
+    if not msgs:
+        return []
+    conn = get_conn()
+    uniq: dict[str, dict] = {}
+    for msg in msgs:
+        mid = msg.get("mid")
+        if mid and mid not in uniq:
+            uniq[mid] = msg
+    if not uniq:
+        return []
+    mids = list(uniq)
+    existing = _existing_mids(conn, mids)
+    new_msgs = [uniq[m] for m in mids if m not in existing]
+    if not new_msgs:
+        return []
+    saved_at = int(time.time() * 1000)
+    rows = [_msg_row(m, saved_at) for m in new_msgs]
+    try:
+        with conn:
+            conn.executemany(_INSERT_MSG_SQL, rows)
+    except Exception as e:
+        log.debug("save_messages error: %s", e)
+        return []
+    return new_msgs
 
 
 def save_message(msg: dict) -> bool:
     """保存一条消息，已存在则忽略"""
-    conn = get_conn()
-    try:
-        cursor = conn.execute("""
-            INSERT OR IGNORE INTO messages
-                (mid, gid, msg_type, msg_type_name, media_type,
-                 sender_id, sender_name, text,
-                 fid, media_orig_url, media_local_path,
-                 url_objects, pic_infos,
-                 template, template_data,
-                 recall_mids, recall_by,
-                 attitude_data,
-                 faith_status, faith_icon, group_name, annotations,
-                 created_at, saved_at, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            msg["mid"],
-            msg.get("gid", 0),
-            msg.get("msg_type", 321),
-            msg.get("msg_type_name", ""),
-            msg.get("media_type", 0),
-            msg.get("sender_id", 0),
-            msg.get("sender_name", ""),
-            msg.get("text", ""),
-            msg.get("fid", ""),
-            msg.get("media_orig_url", ""),
-            msg.get("media_local_path", ""),
-            msg.get("url_objects", ""),
-            msg.get("pic_infos", ""),
-            msg.get("template", ""),
-            msg.get("template_data", "{}"),
-            msg.get("recall_mids", "[]"),
-            msg.get("recall_by", ""),
-            msg.get("attitude_data", "{}"),
-            msg.get("faith_status", 0),
-            msg.get("faith_icon", ""),
-            msg.get("group_name", ""),
-            msg.get("annotations", "{}"),
-            int(msg.get("created_at", 0)),
-            int(time.time() * 1000),
-            msg.get("raw_json", ""),
-        ))
-        conn.commit()
-        return cursor.rowcount > 0
-    except Exception as e:
-        log.debug("save_message error: %s", e)
-        return False
+    return bool(save_messages([msg]))
 
 
 def refresh_group_range(gid: int):
-    """爬取完成后刷新群的 min_mid/max_mid 范围（从 messages 表实际数据计算）"""
+    """刷新群的 min_mid/max_mid 范围（从 messages 表实际数据计算）
+
+    全表聚合，成本随群消息量线性增长，仅在增量维护失败时兜底使用。
+    """
     conn = get_conn()
     row = conn.execute(
         "SELECT MIN(mid), MAX(mid) FROM messages WHERE gid=?", (gid,)
@@ -375,21 +470,53 @@ def refresh_group_range(gid: int):
         conn.commit()
 
 
+def bump_group_range(gid: int, mids: list[str]) -> bool:
+    """用本页新增消息的 mid 增量更新群范围（O(1)，替代 refresh_group_range）"""
+    conn = get_conn()
+    with conn:
+        affected = _update_group_mid(conn, gid, mids)
+    if affected == 0:
+        # groups 里没有这个群（或范围列为空），回退到全量刷新
+        refresh_group_range(gid)
+        return False
+    return True
+
+
+def save_media_files(items: list[dict]) -> int:
+    """批量入队待下载媒体（单事务），返回新增条数"""
+    rows = []
+    now = int(time.time() * 1000)
+    for it in items:
+        fid = it.get("fid", "")
+        if not fid:
+            continue
+        rows.append((
+            fid, it.get("gid", 0), it.get("mid", ""),
+            it.get("media_type", 0), it.get("orig_url", ""), "pending", now,
+        ))
+    if not rows:
+        return 0
+    conn = get_conn()
+    before = conn.total_changes
+    try:
+        with conn:
+            conn.executemany("""
+                INSERT OR IGNORE INTO media_files
+                    (fid, gid, mid, media_type, orig_url, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+    except Exception as e:
+        log.debug("save_media_files error: %s", e)
+        return 0
+    return conn.total_changes - before
+
+
 def save_media_file(fid: str, gid: int = 0, mid: str = "",
                     media_type: int = 0, orig_url: str = "") -> bool:
-    conn = get_conn()
-    now = int(time.time() * 1000)
-    try:
-        conn.execute("""
-            INSERT OR IGNORE INTO media_files
-                (fid, gid, mid, media_type, orig_url, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (fid, gid, mid, media_type, orig_url, "pending", now))
-        conn.commit()
-        return True
-    except Exception as e:
-        log.debug("save_media_file error: %s", e)
-        return False
+    return save_media_files([{
+        "fid": fid, "gid": gid, "mid": mid,
+        "media_type": media_type, "orig_url": orig_url,
+    }]) > 0
 
 
 def update_media_file(fid: str, **kwargs):
@@ -417,6 +544,37 @@ def update_message_media_local_path(mid: str, local_path: str):
     conn = get_conn()
     conn.execute("UPDATE messages SET media_local_path=? WHERE mid=?", (local_path, mid))
     conn.commit()
+
+
+def update_media_results(items: list[dict]):
+    """批量回写下载结果（单事务）
+
+    items: [{fid, status, local_path, file_size, md5, mid}, ...]
+    比逐个 update_media_status + update_message_media_local_path 少 2N 次提交。
+    """
+    if not items:
+        return
+    now = int(time.time() * 1000)
+    media_rows = [(
+        it.get("status", "failed"), it.get("local_path", ""),
+        it.get("file_size", 0), it.get("md5", ""), now, it["fid"],
+    ) for it in items if it.get("fid")]
+    msg_rows = [(
+        it["local_path"], it["mid"],
+    ) for it in items if it.get("status") == "done" and it.get("mid") and it.get("local_path")]
+    conn = get_conn()
+    try:
+        with conn:
+            conn.executemany(
+                "UPDATE media_files SET status=?, local_path=?, file_size=?, md5=?, downloaded_at=? WHERE fid=?",
+                media_rows,
+            )
+            if msg_rows:
+                conn.executemany(
+                    "UPDATE messages SET media_local_path=? WHERE mid=?", msg_rows
+                )
+    except Exception as e:
+        log.debug("update_media_results error: %s", e)
 
 
 def set_group_last_fetch(gid: int):

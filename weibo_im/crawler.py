@@ -17,8 +17,8 @@ import urllib3
 from .types import msg_type_name
 from .parser import parse_messages
 from .db import (
-    init_db, save_groups, save_message, save_media_file,
-    get_latest_mid, get_skip_gids,
+    init_db, save_groups, save_messages, save_media_files,
+    bump_group_range, get_group_mid_range, get_skip_gids,
 )
 from .media import download_pending
 
@@ -332,6 +332,18 @@ def fetch_messages(session: requests.Session, gid: int,
 # ── 爬取逻辑 ──────────────────────────────────────────────
 
 
+def _queue_media(msgs: list[dict], gid: int) -> int:
+    """把消息里的媒体批量放入下载队列，返回新增文件数"""
+    items = [{
+        "fid": pm["fid"],
+        "gid": gid,
+        "mid": pm["mid"],
+        "media_type": pm["media_type"],
+        "orig_url": pm["media_orig_url"],
+    } for pm in msgs if pm.get("fid") and pm.get("media_orig_url")]
+    return save_media_files(items) if items else 0
+
+
 class Crawler:
     """爬虫核心类"""
 
@@ -380,8 +392,9 @@ class Crawler:
             since_time: 毫秒时间戳，消息早于此时停止翻页。
                         None → 首次运行默认回到今天零点
         """
-        last_mid = get_latest_mid(gid)
-        first_run = not last_mid
+        # 群范围直接从 groups 表取（O(1)），不必扫 messages 表找最新 mid
+        min_mid, max_mid = get_group_mid_range(gid)
+        first_run = not max_mid
 
         if first_run:
             # 首次运行：默认回到今天零点
@@ -392,8 +405,6 @@ class Crawler:
 
         # 非首次运行 + 指定时间 → 填补空隙（从 min_mid 往前翻到 since_time）
         if since_time is not None:
-            from .db import get_group_mid_range
-            min_mid, _ = get_group_mid_range(gid)
             return self._backfill_group(gid, name,
                                         since_time=since_time,
                                         start_mid=min_mid)
@@ -406,8 +417,6 @@ class Crawler:
         new_count = 0
         media_count = 0
         cursor = ""  # 从最新开始
-        from .db import get_group_mid_range
-        _, max_mid = get_group_mid_range(gid)
 
         for page in range(100):
             msgs = fetch_messages(self.session, gid, count=50,
@@ -423,18 +432,14 @@ class Crawler:
 
             # 过滤掉已知旧消息，只处理新消息
             parsed = parse_messages(msgs, default_gid=gid)
-            for pm in parsed:
-                if max_mid and pm["mid"] <= max_mid:
-                    continue  # 跳过已知消息
-                if save_message(pm):
-                    new_count += 1
-                    if pm["fid"] and pm["media_orig_url"]:
-                        save_media_file(
-                            fid=pm["fid"], gid=gid, mid=pm["mid"],
-                            media_type=pm["media_type"],
-                            orig_url=pm["media_orig_url"],
-                        )
-                        media_count += 1
+            to_save = [pm for pm in parsed
+                       if not (max_mid and pm["mid"] <= max_mid)]
+            saved = save_messages(to_save)
+            if saved:
+                new_count += len(saved)
+                media_count += _queue_media(saved, gid)
+                # 增量维护群范围，避免每页都对整群做 MIN/MAX 聚合
+                bump_group_range(gid, [pm["mid"] for pm in saved])
 
             if len(msgs) < 50:
                 break  # 无更多页
@@ -442,10 +447,7 @@ class Crawler:
             cursor = str(msgs[0].get("id", ""))
             _jitter_sleep(0.3)
 
-        # 刷新线段范围
         if new_count > 0:
-            from .db import refresh_group_range
-            refresh_group_range(gid)
             log.info("  ⇣ [%s] +%d 条新消息 (%d 个文件)",
                      name, new_count, media_count)
         return {"new": new_count, "total": new_count, "media": media_count}
@@ -475,51 +477,29 @@ class Crawler:
             if not msgs:
                 break
 
-            # 检查最旧的消息是否已达截止时间
-            # API 从旧到新，msgs[-1] 是页面上最新的
-            oldest_ts = (msgs[-1].get("time") or 0)
-            if since_time and oldest_ts:
-                if oldest_ts < 1_000_000_000_000:
-                    oldest_ts *= 1000
-                if oldest_ts < since_time:
-                    # 最新消息已早于截止时间，但这一页里可能还有部分要存的
-                    pass  # 继续处理本页，后面用 break 退出循环
-
             parsed = parse_messages(msgs, default_gid=gid)
+            # 从最新往最旧处理，遇到早于 since_time 的消息就停在本页
+            to_save = []
+            reached_since = False
             for pm in reversed(parsed):
                 if since_time and pm["created_at"] < since_time:
-                    # 这条消息已经太旧了，停止
-                    cursor = ""
+                    reached_since = True
                     break
-                if save_message(pm):
-                    new_count += 1
-                    if pm["fid"] and pm["media_orig_url"]:
-                        save_media_file(
-                            fid=pm["fid"], gid=gid, mid=pm["mid"],
-                            media_type=pm["media_type"],
-                            orig_url=pm["media_orig_url"],
-                        )
-                        media_count += 1
-            else:
-                # 没有触发 time break，继续翻页
-                # msgs[0] = 本页最旧消息，传给 max_mid 以翻到更早的下一页
-                cursor = str(msgs[0].get("id", ""))
+                to_save.append(pm)
 
-                if len(msgs) < 50:
-                    break
+            saved = save_messages(to_save)
+            if saved:
+                new_count += len(saved)
+                media_count += _queue_media(saved, gid)
+                bump_group_range(gid, [pm["mid"] for pm in saved])
 
-                # 本页全部入库，左边界前移
-                from .db import refresh_group_range
-                refresh_group_range(gid)
-                _jitter_sleep(1.0)
-                continue
-
-            # 触发了 time break，退出
-            break
+            if reached_since or len(msgs) < 50:
+                break
+            # msgs[0] = 本页最旧消息，传给 max_mid 以翻到更早的下一页
+            cursor = str(msgs[0].get("id", ""))
+            _jitter_sleep(1.0)
 
         if new_count:
-            from .db import refresh_group_range
-            refresh_group_range(gid)
             log.info("  ⬇ [%s] 回填 %d 条历史 (%d 个文件)",
                      name, new_count, media_count)
         return {"new": new_count, "total": new_count, "media": media_count}
@@ -562,8 +542,8 @@ class Crawler:
                 log.warning("  ✗ [%s] 错误: %s", g["name"], e)
                 _jitter_sleep(group_interval, 0.15)
 
-        # 统一下载媒体文件
-        if download_media and total_media > 0:
+        # 统一下载媒体文件（队列为空时 download_pending 立即返回）
+        if download_media:
             self.download_all_media()
 
         # 扫描链接文件
@@ -683,14 +663,13 @@ class Crawler:
         return boundary
 
     def download_all_media(self):
-        """下载所有待处理的媒体文件（逐个下载直到队列清空）"""
+        """下载所有待处理的媒体文件（成批下载直到队列清空）"""
         total = 0
         while True:
-            count = download_pending(limit=10)
+            count = download_pending(limit=20)
             if count == 0:
                 break
             total += count
-            _jitter_sleep(0.3)
         if total > 0:
             log.info("媒体下载完成: %d 个", total)
 

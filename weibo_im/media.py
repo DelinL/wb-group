@@ -6,14 +6,17 @@ import time
 import json
 import hashlib
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
 
 from .db import (
     update_media_status, update_message_media_local_path,
-    get_pending_media,
+    update_media_results, get_pending_media,
 )
 
 urllib3.disable_warnings()
@@ -118,6 +121,28 @@ def set_cookie(c: str):
     _COOKIE = c
 
 
+# 每线程一个 Session：复用 TCP/TLS 连接（图片服务器同域，keep-alive 可省掉
+# 每个文件的握手），同时避免多线程共享 Session 的线程安全问题。
+_tls = threading.local()
+
+# 默认并发下载数。媒体是独立 HTTPS 域名，4 路足够提速又不容易触发限流。
+DEFAULT_WORKERS = 4
+
+
+def _get_session() -> requests.Session:
+    session = getattr(_tls, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.verify = False
+        session.headers.update(HEADERS)
+        adapter = HTTPAdapter(pool_connections=DEFAULT_WORKERS,
+                              pool_maxsize=DEFAULT_WORKERS * 4)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _tls.session = session
+    return session
+
+
 def download_file(fid: str, url: str, media_type: int,
                   timeout: int = 60) -> dict:
     """下载单个媒体文件，返回 {status, local_path, file_size, md5}"""
@@ -149,24 +174,26 @@ def download_file(fid: str, url: str, media_type: int,
         ck = get_cookie_or_default()
         if ck:
             h["Cookie"] = ck
-        resp = requests.get(
+        resp = _get_session().get(
             url,
             headers=h,
             timeout=timeout,
-            verify=False,
             stream=True,
         )
-        if resp.status_code != 200:
-            log.warning("下载失败 [HTTP %d]: %s", resp.status_code, url)
-            return {"status": "failed", "local_path": "", "file_size": 0, "md5": ""}
+        try:
+            if resp.status_code != 200:
+                log.warning("下载失败 [HTTP %d]: %s", resp.status_code, url)
+                return {"status": "failed", "local_path": "", "file_size": 0, "md5": ""}
 
-        # 写入文件
-        file_size = 0
-        with open(local_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    file_size += len(chunk)
+            # 写入文件（64KB 一块，减少 syscall）
+            file_size = 0
+            with open(local_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+                        file_size += len(chunk)
+        finally:
+            resp.close()
 
         # 根据响应头修正扩展名
         ct = resp.headers.get("Content-Type", "")
@@ -185,24 +212,38 @@ def download_file(fid: str, url: str, media_type: int,
         return {"status": "failed", "local_path": "", "file_size": 0, "md5": ""}
 
 
-def download_pending(limit: int = 10, cookie: str = ""):
-    """下载 pending 状态的媒体文件"""
+def download_pending(limit: int = 20, cookie: str = "", workers: int | None = None):
+    """下载 pending 状态的媒体文件
+
+    多线程并发下载（纯网络 IO），下载结果回到主线程一次性批量写库，
+    避免多线程争用同一个 SQLite 连接。
+    """
     if cookie:
         set_cookie(cookie)
     get_cookie_or_default()  # 确保 cookie 被加载
     files = get_pending_media(limit)
-    for f in files:
-        result = download_file(f["fid"], f["orig_url"], f["media_type"])
-        update_media_status(
-            f["fid"],
-            status=result["status"],
-            local_path=result["local_path"],
-            file_size=result["file_size"],
-            md5=result["md5"],
-        )
-        # 回写 messages 的 media_local_path
-        if result["status"] == "done" and f["mid"]:
-            update_message_media_local_path(f["mid"], result["local_path"])
+    if not files:
+        return 0
+
+    workers = DEFAULT_WORKERS if workers is None else max(1, int(workers))
+    tasks = [(f["fid"], f["orig_url"], f["media_type"]) for f in files]
+    if workers > 1 and len(tasks) > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as pool:
+            results = list(pool.map(lambda t: download_file(*t), tasks))
+    else:
+        results = [download_file(*t) for t in tasks]
+
+    update_media_results([
+        {
+            "fid": f["fid"],
+            "mid": f["mid"],
+            "status": r["status"],
+            "local_path": r["local_path"],
+            "file_size": r["file_size"],
+            "md5": r["md5"],
+        }
+        for f, r in zip(files, results)
+    ])
     return len(files)
 
 

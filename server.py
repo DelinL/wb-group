@@ -716,6 +716,9 @@ def _preview_export_file(path: str, fmt: str) -> list[dict]:
 class Handler(BaseHTTPRequestHandler):
     # 子类在 make_server 中注入 db_path 与 conn
     db_path = None
+    # HTTP/1.1 开启 keep-alive：前端几十个请求/图片复用同一条连接，
+    # 所有响应都显式带 Content-Length，可以安全长连接
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *args):
         pass  # 静默，避免刷屏
@@ -737,16 +740,59 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _send_file(self, local_path, cache=True):
-        with open(local_path, "rb") as f:
-            data = f.read()
-        ctype = _guess_content_type(local_path)
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
+        """流式返回文件，支持 Range（视频可拖动进度条），不再整文件读入内存"""
+        try:
+            size = os.path.getsize(local_path)
+        except OSError:
+            self._send_text("Not Found", status=404)
+            return
+
+        start, end = 0, size - 1
+        partial = False
+        range_header = self.headers.get("Range", "") if self.headers is not None else ""
+        if range_header.startswith("bytes="):
+            spec = range_header[len("bytes="):].split(",")[0].strip()
+            try:
+                first, _, last = spec.partition("-")
+                if first == "":
+                    length = int(last)
+                    if length > 0:
+                        start = max(0, size - length)
+                else:
+                    start = int(first)
+                    if last:
+                        end = min(int(last), size - 1)
+                if size == 0 or start >= size or start > end:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                partial = True
+            except ValueError:
+                start, end, partial = 0, size - 1, False
+
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", _guess_content_type(local_path))
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         if cache:
             self.send_header("Cache-Control", "max-age=31536000")
         self.end_headers()
-        self.wfile.write(data)
+        if self.command == "HEAD":
+            return
+
+        remaining = end - start + 1
+        with open(local_path, "rb") as f:
+            f.seek(start)
+            while remaining > 0:
+                chunk = f.read(min(262144, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def _serve_media_static(self, path):
         """服务 media/ 下已下载文件，防目录穿越。"""
@@ -1072,8 +1118,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "token 无效或已过期"}, status=404)
             return
         try:
-            with open(path, "rb") as f:
-                data = f.read()
+            size = os.path.getsize(path)
         except OSError as e:
             self._send_json({"error": f"读取文件失败: {e}"}, status=500)
             return
@@ -1084,13 +1129,19 @@ class Handler(BaseHTTPRequestHandler):
         ctype = _guess_content_type(path)
         self.send_response(200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(size))
         self.send_header(
             "Content-Disposition",
             f"attachment; filename=\"{filename_encoded}\"; "
             f"filename*=UTF-8''{filename_encoded}")
         self.end_headers()
-        self.wfile.write(data)
+        # 流式发送：导出文件可能上百 MB，避免整份读进内存
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(262144)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
     def _serve_static(self, rel):
         # 防目录穿越

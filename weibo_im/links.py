@@ -7,6 +7,7 @@ import time
 import json
 import hashlib
 import logging
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -61,7 +62,35 @@ CONTENT_TYPE_MAP: dict[str, str] = {
 }
 
 _COOKIE: str = ""
-_HEADERS: dict = {}
+_HEADERS: dict = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+_tls = threading.local()
+
+
+def _get_session() -> requests.Session:
+    """每线程复用一个 Session，探测/下载都走 keep-alive 连接池"""
+    session = getattr(_tls, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.verify = False
+        session.headers.update(_HEADERS)
+        _tls.session = session
+    return session
+
+
+def _request_headers() -> dict:
+    h = dict(_HEADERS)
+    ck = get_cookie_or_default()
+    if ck:
+        h["Cookie"] = ck
+    return h
 
 
 def get_cookie_or_default() -> str:
@@ -73,16 +102,8 @@ def get_cookie_or_default() -> str:
 
 
 def set_cookie(c: str):
-    global _COOKIE, _HEADERS
+    global _COOKIE
     _COOKIE = c
-    _HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    }
 
 
 URL_PATTERN = re.compile(r'https?://[^\s，。、\'\"\]\)）】〞〟»›»]+')
@@ -98,12 +119,8 @@ def resolve_tcn(url: str, timeout: int = 10) -> str:
     if "t.cn" not in url:
         return url
     try:
-        h = dict(_HEADERS) if _HEADERS else {}
-        ck = get_cookie_or_default()
-        if ck:
-            h["Cookie"] = ck
-        resp = requests.head(url, headers=h, timeout=timeout,
-                             allow_redirects=True, verify=False)
+        resp = _get_session().head(url, headers=_request_headers(),
+                                   timeout=timeout, allow_redirects=True)
         return resp.url or url
     except Exception:
         return url
@@ -122,12 +139,8 @@ def is_downloadable_file(url: str) -> tuple[str, str] | None:
 
     # 2. 没有后缀，发 HEAD 请求检查 Content-Type
     try:
-        h = dict(_HEADERS) if _HEADERS else {}
-        ck = get_cookie_or_default()
-        if ck:
-            h["Cookie"] = ck
-        resp = requests.head(url, headers=h, timeout=10,
-                             allow_redirects=True, verify=False)
+        resp = _get_session().head(url, headers=_request_headers(), timeout=10,
+                                   allow_redirects=True)
         ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
         if ct in CONTENT_TYPE_MAP:
             return (CONTENT_TYPE_MAP[ct], resp.url or url)
@@ -155,23 +168,22 @@ def download_link_file(url: str, file_type: str, mid: str = "",
         }
 
     try:
-        h = dict(_HEADERS) if _HEADERS else {}
-        ck = get_cookie_or_default()
-        if ck:
-            h["Cookie"] = ck
         log.info("下载链接文件: %s", url)
-        resp = requests.get(url, headers=h, timeout=timeout,
-                            stream=True, verify=False)
-        if resp.status_code != 200:
-            log.warning("链接文件下载失败 [HTTP %d]: %s", resp.status_code, url)
-            return {"status": "failed", "local_path": "", "file_size": 0, "md5": ""}
+        resp = _get_session().get(url, headers=_request_headers(),
+                                  timeout=timeout, stream=True)
+        try:
+            if resp.status_code != 200:
+                log.warning("链接文件下载失败 [HTTP %d]: %s", resp.status_code, url)
+                return {"status": "failed", "local_path": "", "file_size": 0, "md5": ""}
 
-        file_size = 0
-        with open(local_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
-                    file_size += len(chunk)
+            file_size = 0
+            with open(local_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+                        file_size += len(chunk)
+        finally:
+            resp.close()
 
         md5 = _calc_md5(local_path)
         log.info("链接文件下载完成: %s (%d bytes)", local_path, file_size)
@@ -189,11 +201,14 @@ def download_link_file(url: str, file_type: str, mid: str = "",
         return {"status": "failed", "local_path": "", "file_size": 0, "md5": ""}
 
 
-def _save_link_file(gid: int, mid: str, url: str, url_hash: str,
-                    file_type: str, local_path: str,
-                    file_size: int, md5: str, status: str):
-    """写入 link_files 表"""
-    conn = get_conn()
+_LINK_TABLE_READY = False
+
+
+def _ensure_link_table(conn):
+    """link_files 表懒创建，进程内只执行一次 DDL"""
+    global _LINK_TABLE_READY
+    if _LINK_TABLE_READY:
+        return
     conn.execute("""
         CREATE TABLE IF NOT EXISTS link_files (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,6 +225,16 @@ def _save_link_file(gid: int, mid: str, url: str, url_hash: str,
             UNIQUE(url_hash)
         )
     """)
+    conn.commit()
+    _LINK_TABLE_READY = True
+
+
+def _save_link_file(gid: int, mid: str, url: str, url_hash: str,
+                    file_type: str, local_path: str,
+                    file_size: int, md5: str, status: str):
+    """写入 link_files 表"""
+    conn = get_conn()
+    _ensure_link_table(conn)
     now = int(time.time() * 1000)
     conn.execute("""
         INSERT OR REPLACE INTO link_files
@@ -224,24 +249,7 @@ def _save_link_file(gid: int, mid: str, url: str, url_hash: str,
 def scan_and_download_messages(limit: int = 200):
     """扫描消息中的外部链接，检测并下载文件"""
     conn = get_conn()
-    # 确保表存在
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS link_files (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            url_hash  TEXT NOT NULL,
-            url       TEXT NOT NULL,
-            gid       INTEGER DEFAULT 0,
-            mid       TEXT DEFAULT '',
-            file_type TEXT DEFAULT '',
-            local_path TEXT DEFAULT '',
-            file_size INTEGER DEFAULT 0,
-            md5       TEXT DEFAULT '',
-            status    TEXT DEFAULT 'pending',
-            created_at INTEGER NOT NULL,
-            UNIQUE(url_hash)
-        )
-    """)
-    conn.commit()
+    _ensure_link_table(conn)
 
     # 获取已扫描过的 url_hash
     scanned = set(r[0] for r in conn.execute(
