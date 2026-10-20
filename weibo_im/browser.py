@@ -146,7 +146,9 @@ class BrowserSession:
             "locale": "zh-CN",
             "timezone_id": "Asia/Shanghai",
             "viewport": {"width": 1440, "height": 900},
-            "ignore_https_errors": True,
+            # 保持证书校验（微博证书链正常）。原为 True（忽略证书错误），
+            # 与 HTTP 模式的 verify=False 同源问题，2026-10-20 关闭。
+            "ignore_https_errors": False,
             "user_agent": _UA,
             "args": [
                 # 去掉 navigator.webdriver 这一显式自动化标记，避免无谓的特征差异。

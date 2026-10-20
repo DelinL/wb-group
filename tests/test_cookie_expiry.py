@@ -1,6 +1,7 @@
 import logging
 import runpy
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -87,18 +88,17 @@ def test_crawl_all_does_not_swallow_cookie_expiry():
             crawler.crawl_all()
 
 
-def test_script_entrypoint_reports_renew_only_for_cookie_expiry(
-    caplog, tmp_path
-):
+def test_script_entrypoint_reports_renew_only_for_cookie_expiry(caplog):
     class ExpiredCrawler:
-        def __init__(self, db_path):
+        def __init__(self, db_path, cookie="", browser=None):
             pass
 
         def sync_groups(self):
             raise crawler_module.CookieExpiredError("expired")
 
     script = Path(__file__).parents[1] / "crawl.py"
-    db_path = tmp_path / "test.db"
+    tmpdir = tempfile.mkdtemp(prefix="wb_entry_")
+    db_path = Path(tmpdir) / "test.db"
     with patch.object(crawler_module, "Crawler", ExpiredCrawler), \
          patch.object(
              sys,
@@ -112,18 +112,17 @@ def test_script_entrypoint_reports_renew_only_for_cookie_expiry(
     assert "uv run crawl.py --renew-cookie" in caplog.text
 
 
-def test_script_entrypoint_does_not_report_renew_for_unrelated_error(
-    caplog, tmp_path
-):
+def test_script_entrypoint_does_not_report_renew_for_unrelated_error(caplog):
     class BrokenCrawler:
-        def __init__(self, db_path):
+        def __init__(self, db_path, cookie="", browser=None):
             pass
 
         def sync_groups(self):
             raise RuntimeError("network error")
 
     script = Path(__file__).parents[1] / "crawl.py"
-    db_path = tmp_path / "test.db"
+    tmpdir = tempfile.mkdtemp(prefix="wb_entry2_")
+    db_path = Path(tmpdir) / "test.db"
     with patch.object(crawler_module, "Crawler", BrokenCrawler), \
          patch.object(
              sys,

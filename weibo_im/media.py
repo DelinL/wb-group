@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
-import urllib3
 from requests.adapters import HTTPAdapter
 
 from .db import (
@@ -19,11 +18,14 @@ from .db import (
     update_media_results, get_pending_media,
 )
 
-urllib3.disable_warnings()
 log = logging.getLogger("weibo_im.media")
 
 # 下载根目录 — 相对于本文件: <project>/media/
 MEDIA_ROOT = Path(__file__).resolve().parent.parent / "media"
+
+# 单个媒体文件的下载上限（字节）。4 路并发且不限长时，一个异常大文件
+# 就能写满磁盘；512MB 足够覆盖群内常见视频与文档。
+MAX_MEDIA_BYTES = 512 * 1024 * 1024
 
 # User-Agent 与 API 一致
 HEADERS = {
@@ -62,9 +64,12 @@ def _patch_ext_from_response(local_path: str, content_type: str,
     if content_disposition:
         m = re.search(r'filename\*?=(?:UTF-8\'\')?\"?([^\"\n;]+)', content_disposition)
         if m:
-            name = m.group(1)
-            name = unquote(name)
-            if name:
+            name = unquote(m.group(1))
+            # 响应头属不可信输入：只取 basename，再剥掉反斜杠/NUL，
+            # 防止 "../../x" 或绝对路径把文件写到 media 目录之外
+            name = os.path.basename(name.replace("\\", "/"))
+            name = name.replace("\x00", "").strip()
+            if name and name not in (".", ".."):
                 new_path = os.path.join(save_dir, name)
                 if not os.path.isfile(new_path) and os.path.isfile(local_path):
                     os.rename(local_path, new_path)
@@ -133,7 +138,7 @@ def _get_session() -> requests.Session:
     session = getattr(_tls, "session", None)
     if session is None:
         session = requests.Session()
-        session.verify = False
+        # 保持默认 TLS 证书校验（原 verify=False 已移除，2026-10-20）
         session.headers.update(HEADERS)
         adapter = HTTPAdapter(pool_connections=DEFAULT_WORKERS,
                               pool_maxsize=DEFAULT_WORKERS * 4)
@@ -192,6 +197,10 @@ def download_file(fid: str, url: str, media_type: int,
                     if chunk:
                         f.write(chunk)
                         file_size += len(chunk)
+                        if file_size > MAX_MEDIA_BYTES:
+                            raise ValueError(
+                                f"文件超过大小上限 {MAX_MEDIA_BYTES} 字节"
+                            )
         finally:
             resp.close()
 
@@ -209,6 +218,12 @@ def download_file(fid: str, url: str, media_type: int,
 
     except Exception as e:
         log.error("下载异常: %s — %s", url, e)
+        # 清掉残缺文件，避免下次因「本地已存在」被当成下载完成
+        try:
+            if os.path.isfile(local_path):
+                os.remove(local_path)
+        except OSError:
+            pass
         return {"status": "failed", "local_path": "", "file_size": 0, "md5": ""}
 
 

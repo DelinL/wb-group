@@ -723,6 +723,53 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # 静默，避免刷屏
 
+    def _guard_local(self) -> bool:
+        """只接受本机来源的请求：防 DNS rebinding 与跨站触发写操作。
+
+        - Host 头必须是回环名或本服务实际绑定的地址。默认绑 127.0.0.1 时，
+          这阻断「恶意域名解析到 127.0.0.1 后从网页读取数据」的 rebinding；
+        - 带 Origin 且非本机来源的请求拒绝（防任意网页跨站 POST /api/sync、
+          /api/renew 等写操作）；
+        - Sec-Fetch-Site 为 cross-site / same-site 的浏览器请求拒绝。
+        非浏览器客户端（curl / 测试）不带这些头，保持可用。
+        """
+        try:
+            bind_host = str(self.server.server_address[0]).lower()
+        except Exception:
+            bind_host = "127.0.0.1"
+
+        host = (self.headers.get("Host") or "").lower()
+        hostname = host
+        if hostname.startswith("["):
+            hostname = hostname.split("]")[0][1:]
+        elif ":" in hostname:
+            hostname = hostname.split(":", 1)[0]
+
+        allowed = {"127.0.0.1", "localhost", "::1", bind_host}
+        exposed = bind_host in ("0.0.0.0", "::", "")
+
+        if not exposed and hostname not in allowed:
+            self.close_connection = True
+            self._send_json({"error": "forbidden host"}, status=403)
+            return False
+
+        origin = self.headers.get("Origin")
+        if origin:
+            o = urlparse(origin)
+            o_host = (o.hostname or "").lower()
+            # 主动绑 0.0.0.0 时允许同 Host 的局域网访问，否则只认本机名
+            ok = (o_host == hostname) if exposed else (o_host in allowed)
+            if not ok:
+                self.close_connection = True
+                self._send_json({"error": "forbidden origin"}, status=403)
+                return False
+
+        if (self.headers.get("Sec-Fetch-Site") or "").lower() in ("cross-site", "same-site"):
+            self.close_connection = True
+            self._send_json({"error": "forbidden cross-site"}, status=403)
+            return False
+        return True
+
     def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -820,6 +867,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send_file(full)
 
     def do_GET(self):
+        if not self._guard_local():
+            return
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
@@ -859,6 +908,8 @@ class Handler(BaseHTTPRequestHandler):
         return data if isinstance(data, dict) else {}
 
     def do_POST(self):
+        if not self._guard_local():
+            return
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/api/sync":

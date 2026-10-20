@@ -551,3 +551,37 @@ class SyncApiTest(_ServerTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServerLocalGuardTest(_ServerTestBase):
+    """Host/Origin 校验：只接受本机来源，阻断 DNS rebinding 与跨站写操作。"""
+
+    def _request(self, method, path, headers):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request(method, path, headers=headers)
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8")
+        conn.close()
+        return resp.status, body
+
+    def test_foreign_host_rejected(self):
+        status, _ = self._request("GET", "/", {"Host": "evil.example.com"})
+        self.assertEqual(status, 403)
+
+    def test_localhost_host_allowed(self):
+        status, _ = self._request("GET", "/", {"Host": f"localhost:{self.port}"})
+        self.assertEqual(status, 200)
+
+    def test_cross_origin_post_rejected(self):
+        status, _ = self._request(
+            "POST", "/api/sync",
+            {"Origin": "http://evil.example.com", "Content-Length": "0"},
+        )
+        self.assertEqual(status, 403)
+
+    def test_cross_site_fetch_rejected(self):
+        status, _ = self._request(
+            "POST", "/api/sync",
+            {"Sec-Fetch-Site": "cross-site", "Content-Length": "0"},
+        )
+        self.assertEqual(status, 403)

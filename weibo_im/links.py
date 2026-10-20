@@ -12,15 +12,22 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-import urllib3
 
 from .db import get_conn
 
-urllib3.disable_warnings()
 log = logging.getLogger("weibo_im.links")
 
 # 下载根目录 — 文件存在 <project>/media/files/ 下
 FILES_ROOT = Path(__file__).resolve().parent.parent / "media" / "files"
+
+# 单个外链文件的下载上限（字节）。链接来自群消息，属于不可信输入：
+# 不设上限时一个超大文件就能写满磁盘。
+MAX_LINK_FILE_BYTES = 200 * 1024 * 1024  # 200 MB
+
+# 允许携带微博 Cookie 的域名白名单。
+# 外链请求（群友贴的任意 URL）绝不能带 Cookie——否则等于把完整登录态
+# （含 SUB）交给第三方服务器，对方记个 Header 就能接管账号。
+COOKIE_DOMAINS = ("weibo.com", "weibo.cn", "sina.com.cn", "sinaimg.cn", "t.cn")
 
 # 识别的文件类型
 FILE_EXTENSIONS = {
@@ -79,17 +86,29 @@ def _get_session() -> requests.Session:
     session = getattr(_tls, "session", None)
     if session is None:
         session = requests.Session()
-        session.verify = False
+        # 保持默认 TLS 证书校验（原 verify=False 已移除，2026-10-20）
         session.headers.update(_HEADERS)
         _tls.session = session
     return session
 
 
-def _request_headers() -> dict:
+def _is_weibo_host(url: str) -> bool:
+    """URL 是否属于微博/新浪系域名（只有这些域名才允许带登录态）"""
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == d or host.endswith("." + d) for d in COOKIE_DOMAINS)
+
+
+def _request_headers(url: str = "") -> dict:
+    """构造请求头；Cookie 只发给微博系域名，外链一律不带。
+
+    外链 URL 来自群消息正文/分享卡片，完全不可信。把 SUB 发过去等于
+    泄露账号，故按域名白名单决定是否附带。
+    """
     h = dict(_HEADERS)
-    ck = get_cookie_or_default()
-    if ck:
-        h["Cookie"] = ck
+    if url and _is_weibo_host(url):
+        ck = get_cookie_or_default()
+        if ck:
+            h["Cookie"] = ck
     return h
 
 
@@ -119,7 +138,7 @@ def resolve_tcn(url: str, timeout: int = 10) -> str:
     if "t.cn" not in url:
         return url
     try:
-        resp = _get_session().head(url, headers=_request_headers(),
+        resp = _get_session().head(url, headers=_request_headers(url),
                                    timeout=timeout, allow_redirects=True)
         return resp.url or url
     except Exception:
@@ -139,7 +158,7 @@ def is_downloadable_file(url: str) -> tuple[str, str] | None:
 
     # 2. 没有后缀，发 HEAD 请求检查 Content-Type
     try:
-        resp = _get_session().head(url, headers=_request_headers(), timeout=10,
+        resp = _get_session().head(url, headers=_request_headers(url), timeout=10,
                                    allow_redirects=True)
         ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
         if ct in CONTENT_TYPE_MAP:
@@ -169,7 +188,7 @@ def download_link_file(url: str, file_type: str, mid: str = "",
 
     try:
         log.info("下载链接文件: %s", url)
-        resp = _get_session().get(url, headers=_request_headers(),
+        resp = _get_session().get(url, headers=_request_headers(url),
                                   timeout=timeout, stream=True)
         try:
             if resp.status_code != 200:
@@ -182,6 +201,10 @@ def download_link_file(url: str, file_type: str, mid: str = "",
                     if chunk:
                         f.write(chunk)
                         file_size += len(chunk)
+                        if file_size > MAX_LINK_FILE_BYTES:
+                            raise ValueError(
+                                f"文件超过大小上限 {MAX_LINK_FILE_BYTES} 字节"
+                            )
         finally:
             resp.close()
 
@@ -196,6 +219,12 @@ def download_link_file(url: str, file_type: str, mid: str = "",
 
     except Exception as e:
         log.error("链接文件下载异常: %s — %s", url, e)
+        # 清掉残缺文件，避免下次因「本地已存在」被当成下载完成
+        try:
+            if os.path.isfile(local_path):
+                os.remove(local_path)
+        except OSError:
+            pass
         _save_link_file(gid, mid, url, url_hash, file_type,
                         "", 0, "", "failed")
         return {"status": "failed", "local_path": "", "file_size": 0, "md5": ""}

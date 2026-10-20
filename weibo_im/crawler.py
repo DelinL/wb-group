@@ -12,7 +12,6 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-import urllib3
 
 from .types import msg_type_name
 from .parser import parse_messages
@@ -22,7 +21,6 @@ from .db import (
 )
 from .media import download_pending
 
-urllib3.disable_warnings()
 log = logging.getLogger("weibo_im.crawler")
 
 API_BASE = "https://api.weibo.com"
@@ -139,7 +137,6 @@ def make_session(cookie: str) -> requests.Session:
     不绑定 domain，使 login.sina.com.cn 等 SSO 域请求也能带上 cookie。
     """
     session = requests.Session()
-    session.verify = False
     session.headers.update(HEADERS)
     for part in cookie.split("; "):
         if "=" in part:
