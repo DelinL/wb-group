@@ -528,10 +528,15 @@ def _init_browser_session(args, log):
     from weibo_im.browser import BrowserSession, DEFAULT_PROFILE_DIR
 
     profile_dir = args.profile_dir or DEFAULT_PROFILE_DIR
+    # --browser-login 默认有头（能直接扫），加 --headless 则只截图（适合无人值守）
+    if args.browser_login:
+        headless = args.headless
+    else:
+        headless = True
     try:
         session = BrowserSession(
             profile_dir,
-            headless=not args.browser_login,
+            headless=headless,
             channel=args.browser_channel,
         )
     except Exception as e:
@@ -579,7 +584,7 @@ def main():
     parser.add_argument("--check-playwright", action="store_true",
                         help="检查 Playwright + Chromium 环境是否就绪（部署前验证）")
     parser.add_argument("--headless", action="store_true",
-                        help="--renew-cookie 时使用无头模式（仅截图，不弹窗；默认有头弹窗）")
+                        help="--renew-cookie / --browser-login 时使用无头模式（仅截图，不弹窗；默认有头弹窗）")
     parser.add_argument("--chrome-path", default="",
                         help="--renew-cookie 时指定本机 Chrome 可执行文件路径（默认自动探测）")
     parser.add_argument("--no-chrome", action="store_true",
