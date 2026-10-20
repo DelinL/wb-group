@@ -14,6 +14,10 @@
     python crawl.py --renew-cookie                     # 打开本机 Chrome 扫码续期 cookie
     python crawl.py --renew-cookie --no-chrome         # 强制用 Playwright 自带 Chromium 扫码
     python crawl.py --renew-cookie --chrome-path /path/to/chrome  # 指定 Chrome 路径
+    python crawl.py --browser-login                    # 【浏览器模式】首次有头扫码，登录态写入 profile
+    python crawl.py --browser                          # 【浏览器模式】日常爬取，免扫码
+    python crawl.py --browser --browser-channel chrome # 用本机 Chrome 内核跑 profile
+    python crawl.py --browser --profile-dir ~/.weibo-profile  # 指定 profile 目录
     python crawl.py --check-playwright                 # 检查 Playwright 环境就绪
     python crawl.py --stats                            # 打印数据库统计
     python crawl.py --search 关键词                    # 全文搜索消息
@@ -26,6 +30,17 @@
     并尝试用系统默认程序打开图片。你在控制台看到「请扫码」提示后，用微博 APP
     扫码，程序检测到登录成功后会把 cookie 写入数据库。
     也可用 --no-chrome 强制走自带 Chromium，或 --chrome-path 指定 Chrome 路径。
+
+浏览器模式（--browser / --browser-login）：
+    两条链路并存，互不影响：
+      HTTP 模式（默认）    cookie 字符串存 SQLite，用 requests 发请求，
+                          快照约 6 天失效，靠 --renew-cookie 重扫
+      浏览器模式（--browser）持久化 Chrome profile 承载登录态，
+                          请求由 ctx.request 借该身份发出，不渲染页面。
+                          微博的 SSO 续期链由浏览器自动完成，因此日常无需
+                          扫码、也无需搬运 cookie。
+    首次使用跑一次 --browser-login（有头窗口扫码），之后都用 --browser。
+    登录态失效时同样跑 --browser-login 重新登录即可。
 """
 from __future__ import annotations
 
@@ -504,6 +519,45 @@ def _do_diff(old_path: str, new_path: str, output: str, fmt: str, log: logging.L
         log.info("无新增消息")
 
 
+def _init_browser_session(args, log):
+    """按需构造 BrowserSession。
+
+    返回 BrowserSession 表示可以继续爬取；返回 None 表示本次不应继续
+    （--browser-login 已完成登录后退出，或初始化/登录失败）。
+    """
+    from weibo_im.browser import BrowserSession, DEFAULT_PROFILE_DIR
+
+    profile_dir = args.profile_dir or DEFAULT_PROFILE_DIR
+    try:
+        session = BrowserSession(
+            profile_dir,
+            headless=not args.browser_login,
+            channel=args.browser_channel,
+        )
+    except Exception as e:
+        log.error("启动浏览器 profile 失败: %s", e)
+        log.error("  → 若提示浏览器未安装: uv run playwright install chromium")
+        return None
+
+    if args.browser_login:
+        ok = session.login_interactive(qr_path=QRCODE_PATH)
+        session.close()
+        if not ok:
+            sys.exit(1)
+        log.info("登录态已保存到 profile: %s", profile_dir)
+        log.info("以后直接运行 `uv run crawl.py --browser` 即可，无需再扫码。")
+        sys.exit(0)
+
+    if not session.probe_login():
+        log.error("profile 里没有有效登录态: %s", profile_dir)
+        log.error("请先运行一次: uv run crawl.py --browser-login")
+        session.close()
+        return None
+
+    log.info("浏览器模式就绪，登录态来自 profile")
+    return session
+
+
 def main():
     parser = argparse.ArgumentParser(description="微博群聊消息抓取（本地版）")
     parser.add_argument("--db", default="", help="数据库路径（默认 <项目>/weibo_im.db）")
@@ -514,6 +568,14 @@ def main():
     parser.add_argument("--group-only", action="store_true", help="只刷新群列表，不爬消息")
     parser.add_argument("--set-cookie", default="", help="设置 cookie 到数据库后退出")
     parser.add_argument("--renew-cookie", action="store_true", help="打开浏览器扫码续期 cookie")
+    parser.add_argument("--browser", action="store_true",
+                        help="【浏览器模式】用持久化 profile 承载登录态爬取（免扫码续期）")
+    parser.add_argument("--browser-login", action="store_true",
+                        help="【浏览器模式】有头打开浏览器扫码，登录态写入 profile 后退出")
+    parser.add_argument("--profile-dir", default="",
+                        help="浏览器 profile 目录（默认 ~/.weibo-profile）")
+    parser.add_argument("--browser-channel", default="",
+                        help="浏览器内核：chrome=本机 Chrome；留空=Playwright 自带 Chromium")
     parser.add_argument("--check-playwright", action="store_true",
                         help="检查 Playwright + Chromium 环境是否就绪（部署前验证）")
     parser.add_argument("--headless", action="store_true",
@@ -694,12 +756,20 @@ def main():
         _do_diff(args.old, args.new, args.diff_output, args.diff_format, log)
         return
 
+    browser_session = None
+    if args.browser or args.browser_login:
+        browser_session = _init_browser_session(args, log)
+        if browser_session is None:
+            # 走到这里一定是失败（成功登录的分支已 sys.exit(0)）
+            sys.exit(1)
+
     try:
-        crawler = Crawler(db_path)
+        crawler = Crawler(db_path, browser=browser_session)
     except RuntimeError as e:
         log.error("Cookie 未设置: %s", e)
         log.error("请运行: python crawl.py --renew-cookie（扫码）")
         log.error("  或: python crawl.py --set-cookie 'SUB=xxx; SUBP=yyy'（手动）")
+        log.error("  或: python crawl.py --browser-login（浏览器模式首次登录）")
         return
 
     # --download-fid: 下载单个媒体文件
@@ -774,5 +844,14 @@ if __name__ == "__main__":
     try:
         main()
     except CookieExpiredError:
-        logging.error("Cookie 已过期，请运行: uv run crawl.py --renew-cookie")
+        logging.error("登录态已失效：")
+        logging.error("  浏览器模式 → uv run crawl.py --browser-login")
+        logging.error("  HTTP 模式  → uv run crawl.py --renew-cookie")
         raise SystemExit(2)
+    finally:
+        # 浏览器模式会拉起一个 Chromium 进程，任何退出路径都要确保关闭
+        try:
+            from weibo_im.browser import close_active
+            close_active()
+        except Exception:
+            pass

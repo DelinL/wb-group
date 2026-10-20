@@ -9,6 +9,8 @@
 
 - 定时增量爬取群聊消息（手动运行或交给系统计划任务）
 - Playwright 扫码登录微博，自动提取 cookie（支持有头弹窗与无头截图两种方式）
+- **浏览器模式**：用持久化 Chrome profile 承载登录态，请求走 `ctx.request`
+  不渲染页面。免搬运 cookie、免定期扫码，由浏览器自己完成微博 SSO 续期
 - SQLite + FTS5 全文搜索
 - 图片 / 视频 / 文件下载，按 Content-Disposition 自动识别扩展名
 - 外部链接文件（PDF / ZIP / DOC 等）识别与下载
@@ -30,7 +32,7 @@
 | 操作系统 | Windows 10+ / macOS / Linux（有桌面或无头均可） |
 | Python | ≥ 3.11 |
 | 包管理 | 推荐 `uv`；也可用标准 `pip` |
-| 浏览器 | Playwright + Chromium（**仅** `--renew-cookie` 扫码需要） |
+| 浏览器 | Playwright + Chromium（`--renew-cookie` 扫码、`--browser-login` 登录、`--browser` 爬取均需要） |
 | 账号 | 一个已加入至少一个微博群聊的微博账号 |
 
 依赖包：`requests`、`urllib3`、`playwright`（见 `pyproject.toml`）。
@@ -55,6 +57,7 @@ weibogroup/
     ├── parser.py         # API 原始消息解析
     ├── db.py             # SQLite + FTS5 读写
     ├── crawler.py        # HTTP 客户端 + 爬取逻辑
+    ├── browser.py        # 浏览器传输层（持久化 profile + ctx.request）
     ├── media.py          # 图片/视频/附件下载
     └── links.py          # 外部链接文件识别与下载
 ```
@@ -84,6 +87,13 @@ uv run crawl.py --renew-cookie
 uv run crawl.py
 ```
 
+**可选：改用浏览器模式**（免搬运 cookie、免定期扫码，详见 4.1.1）
+
+```bash
+uv run crawl.py --browser-login   # 首次：有头扫码，登录态写入 ~/.weibo-profile
+uv run crawl.py --browser          # 以后：日常爬取，直接复用 profile
+```
+
 扫码失败的退路：浏览器打开 `https://api.weibo.com/chat` 手动登录，从 DevTools
 复制 `.weibo.com` 域下所有 cookie 键值，拼成 `k1=v1; k2=v2` 形式，运行：
 
@@ -104,8 +114,41 @@ uv run crawl.py --set-cookie "SUB=xxx; SUBP=yyy; ..."
 |------|------|
 | `uv run crawl.py --renew-cookie` | 扫码登录，自动存 cookie（默认有头弹窗） |
 | `uv run crawl.py --renew-cookie --headless` | 无头模式：二维码截图存 `qrcode.png` 并用系统默认程序打开，适合无桌面 Linux |
+| `uv run crawl.py --browser-login` | 【浏览器模式】有头扫码，登录态直接写入 profile，不写数据库 |
+| `uv run crawl.py --browser` | 【浏览器模式】日常爬取，复用 profile 里的登录态 |
+| `uv run crawl.py --browser --browser-channel chrome` | 用本机 Chrome 内核跑（指纹更接近真实浏览器） |
+| `uv run crawl.py --browser --profile-dir <目录>` | 指定 profile 目录（默认 `~/.weibo-profile`） |
 | `uv run crawl.py --check-playwright` | 检查 Playwright + Chromium 是否就绪 |
 | `uv run crawl.py --set-cookie 'SUB=xxx; SUBP=yyy'` | 手动写入 cookie，不依赖 Playwright |
+
+#### 4.1.1 浏览器模式 vs HTTP 模式
+
+两条链路并存，互不影响。默认仍是 HTTP 模式。
+
+| | HTTP 模式（默认） | 浏览器模式（`--browser`） |
+|---|---|---|
+| 登录态载体 | SQLite 里的 cookie 字符串 | 磁盘上的 Chrome profile 目录 |
+| 发请求的组件 | `requests.Session` | `ctx.request`（Playwright，不渲染页面） |
+| 续期方式 | 距登录超 5 天调一次 SSO 续期链 | 浏览器每次请求自动接收 `Set-Cookie` |
+| 实测有效期 | 约 6 天，到期需 `--renew-cookie` | 持续有效，掉登录后重跑 `--browser-login` |
+| 启动开销 | 约 0.1 秒 | 约 1~3 秒（拉起 Chromium） |
+
+**原理**：`launch_persistent_context(user_data_dir=...)` 给浏览器指定一个固定的
+用户数据目录，登录态落在里面；`ctx.request.get(...)` 借用这个会话身份发 HTTP
+请求，但不渲染页面，所以速度和 `requests` 一个量级。因为请求始终在同一个浏览器
+会话内发出，微博的 SSO 续期链（`updatetgt.php` → `crossdomain.php` → 各域
+`Set-Cookie`）会被浏览器自动完成并写回 profile，因此不存在"快照过期"的问题。
+
+**实现位置**：`weibo_im/browser.py`。它提供 `requests.Session` 的鸭子类型
+（`.request` / `.cookies`），因此 `fetch_contacts` / `fetch_messages` 与退避重试
+逻辑全部复用，无需改动。
+
+**安全注意**：
+
+- profile 目录是**完整登录态**，比数据库里的明文快照更敏感。
+- 默认落在 `~/.weibo-profile`，创建时自动 `chmod 700`。
+- 已加入 `.gitignore`，但**不要**把它放进 iCloud / Dropbox 等同步目录。
+- 需要销毁登录态时直接删目录：`rm -rf ~/.weibo-profile`，代价是重扫一次。
 
 ### 4.2 爬取
 

@@ -15,6 +15,12 @@
 qrcode.png
 qrcode-*.png
 
+# 浏览器模式 profile 目录 —— 内含完整登录态（加密 cookie + 会话数据）
+# 比数据库里的明文快照更敏感。默认目录在 ~/.weibo-profile，此处防止
+# 有人用 --profile-dir 指到项目内后误提交。
+.weibo-profile/
+*.weibo-profile/
+
 # .env / 配置覆盖文件（如果你之后用来存本地配置）
 .env
 .env.*

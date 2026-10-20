@@ -347,16 +347,28 @@ def _queue_media(msgs: list[dict], gid: int) -> int:
 class Crawler:
     """爬虫核心类"""
 
-    def __init__(self, db_path: str | Path, cookie: str = ""):
+    def __init__(self, db_path: str | Path, cookie: str = "", browser=None):
         """初始化爬虫
 
         Args:
             db_path: 数据库路径
             cookie: 可选，如提供则存入 DB；否则从 DB 读取
+            browser: 可选，BrowserSession 实例。传入时走**浏览器模式**：
+                     登录态由持久化 profile 承载，既不读取也不写入数据库里的
+                     cookie 字符串，续期交给浏览器自己完成。
         """
         from .db import set_db_path, set_cookie as db_set_cookie, get_cookie
         set_db_path(str(db_path))
         init_db()
+
+        self.browser = browser
+        if browser is not None:
+            # 浏览器模式：profile 里就是登录态，无需 cookie 字符串
+            self.cookie = ""
+            self.session = browser
+            log.info("传输层: 持久化浏览器 profile（cookie 由浏览器自行续期）")
+            return
+
         if cookie:
             db_set_cookie(cookie)
             self.cookie = cookie
