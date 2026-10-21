@@ -1,16 +1,16 @@
 ---
 name: chen-tonghui-ima-sync
-description: 将微博群聊爬虫项目(jfjzsxh-weibogroup)中「陈同辉-宏观策略」成员的发言，用 mid 水位线增量同步到 ima「陈同辉」知识库——只补新消息、不重不漏、上传版省 token。当用户说"更新陈同辉知识库""陈同辉增量上传ima""同步陈同辉发言到ima""把陈同辉群里新发言传到知识库"或类似表达时使用本 skill。本 skill 紧耦合 /Users/john/jfjzsxh-weibogroup 项目（crawl.py、_chen/、weibo_im.db）。
+description: 将微博群聊爬虫项目(wb-group)中「陈同辉-宏观策略」成员的发言，用 mid 水位线增量同步到 ima「陈同辉」知识库——只补新消息、不重不漏、上传版省 token。当用户说"更新陈同辉知识库""陈同辉增量上传ima""同步陈同辉发言到ima""把陈同辉群里新发言传到知识库"或类似表达时使用本 skill。本 skill 紧耦合 /Users/john/wb-group 项目（crawl.py、_chen/、weibo_im.db）。
 agent_created: true
 ---
 
 # 陈同辉群聊增量同步 ima
 
 ## 用途
-把 jfjzsxh-weibogroup 爬虫 SQLite（weibo_im.db）里「陈同辉-宏观策略」成员的新发言，增量上传到 ima「陈同辉」知识库。核心机制是 **mid 水位线**：记录已成功上传的最大 mid，每次只导出/上传 mid 更大的新消息，上传成功后才推进水位线。**不要用项目内置 `--diff`**（靠文本匹配去重，重复文本/噪声过滤变化会失灵，详见 references/workflow.md）。
+把 wb-group 爬虫 SQLite（weibo_im.db）里「陈同辉-宏观策略」成员的新发言，增量上传到 ima「陈同辉」知识库。核心机制是 **mid 水位线**：记录已成功上传的最大 mid，每次只导出/上传 mid 更大的新消息，上传成功后才推进水位线。**不要用项目内置 `--diff`**（靠文本匹配去重，重复文本/噪声过滤变化会失灵，详见 references/workflow.md）。
 
 ## 关键常量
-- 项目根：`/Users/john/jfjzsxh-weibogroup`
+- 项目根：`/Users/john/wb-group`
 - 群 gid：`4778124434997704`（陈同辉-宏观策略的客服群）
 - 成员 sender_id：`1401164841`（陈同辉-宏观策略）
 - ima 知识库 ID：`7482714307449732`（名称「陈同辉」，可写）
@@ -21,7 +21,7 @@ agent_created: true
 
 ### 1. 爬最新消息进 SQLite
 ```bash
-cd /Users/john/jfjzsxh-weibogroup && uv run python crawl.py
+cd /Users/john/wb-group && uv run python crawl.py
 ```
 若 cookie 过期（报 CookieExpiredError 或 sync_groups 返回空），先 `uv run python crawl.py --renew-cookie` 扫码续期，再爬。
 

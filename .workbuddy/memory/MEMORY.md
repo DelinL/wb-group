@@ -1,4 +1,4 @@
-# 项目长期记忆 — jfjzsxh-weibogroup（微博群聊爬虫）
+# 项目长期记忆 — wb-group（微博群聊爬虫）
 
 ## 项目性质
 微博群聊消息本地爬虫（SQLite + FTS5），CLI 入口 `crawl.py`，核心包 `weibo_im/`。
